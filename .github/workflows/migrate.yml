@@ -9,6 +9,9 @@ jobs:
   migrate:
     runs-on: ubuntu-latest
     timeout-minutes: 59
+    concurrency:
+      group: gori2-migration
+      cancel-in-progress: false
     steps:
       - name: Checkout
         uses: actions/checkout@v4
