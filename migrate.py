@@ -21,6 +21,7 @@ WORKER = os.environ['WORKER_URL'].rstrip('/')
 KEY = os.environ['MIGRATE_KEY']
 BUDGET_MIN = float(os.environ.get('TIME_BUDGET_MIN', '48'))
 TMP = '/tmp/mig_media.bin'
+DL_DIR = '/tmp/migdl'
 START = time.time()
 
 HDRS = {'x-migrate-key': KEY, 'content-type': 'application/json'}
@@ -113,13 +114,14 @@ async def process_message(client, new, m, new_tid, row):
                     file_name=fn, size=size)
         if size > 1950 * 1024 * 1024:
             return 'skipped', None, meta  # over Telegram 2GB upload cap
-        path = await client.download_media(m, file=TMP)
+        os.makedirs(DL_DIR, exist_ok=True)
+        safe_fn = ''.join(c for c in (fn or f'file_{m.id}') if c not in '\\/:*?"<>|').strip() or f'file_{m.id}'
+        path = await client.download_media(m, file=os.path.join(DL_DIR, safe_fn))
         if path:
             try:
                 vid = is_video(doc)
                 sent = await client.send_file(
                     new, path, caption=(text or None),
-                    file_name=(fn or None),
                     reply_to=new_tid,
                     supports_streaming=vid, force_document=not vid)
                 return 'done', sent.id, meta
@@ -143,13 +145,14 @@ async def process_message(client, new, m, new_tid, row):
         meta.update(kind='poll', caption=out)
         return 'done', sent.id, meta
     elif m.media:
-        path = await client.download_media(m, file=TMP)
+        os.makedirs(DL_DIR, exist_ok=True)
+        nm = getattr(getattr(m, 'file', None), 'name', None) or f'media_{m.id}'
+        safe_nm = ''.join(c for c in nm if c not in '\\/:*?"<>|').strip() or f'media_{m.id}'
+        path = await client.download_media(m, file=os.path.join(DL_DIR, safe_nm))
         if path:
             try:
-                nm = getattr(getattr(m, 'file', None), 'name', None) or None
                 sent = await client.send_file(
                     new, path, caption=(text or None),
-                    file_name=nm,
                     reply_to=new_tid)
                 meta['kind'] = 'photo' if mtype == 'MessageMediaPhoto' else mtype
                 return 'done', sent.id, meta
