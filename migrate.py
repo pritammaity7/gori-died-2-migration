@@ -68,7 +68,8 @@ async def seed_topics(client, old):
         offset_id = res.topics[-1].top_message
         if len(res.topics) < 100:
             break
-    closed = [{'root_id': t.id, 'title': getattr(t, 'title', f'topic-{t.id}'), 'closed': True}
+    closed = [{'root_id': t.id, 'title': getattr(t, 'title', f'topic-{t.id}'),
+               'closed': True, 'top_msg': t.top_message or 0}
               for t in topics if t.closed]
     print(f'[SEED] {len(topics)} topics total, {len(closed)} closed -> migrating these')
     api_post('/api/seed', {'topics': closed})
@@ -118,6 +119,7 @@ async def process_message(client, new, m, new_tid, row):
                 vid = is_video(doc)
                 sent = await client.send_file(
                     new, path, caption=(text or None),
+                    file_name=(fn or None),
                     reply_to=new_tid,
                     supports_streaming=vid, force_document=not vid)
                 return 'done', sent.id, meta
@@ -144,8 +146,10 @@ async def process_message(client, new, m, new_tid, row):
         path = await client.download_media(m, file=TMP)
         if path:
             try:
+                nm = getattr(getattr(m, 'file', None), 'name', None) or None
                 sent = await client.send_file(
                     new, path, caption=(text or None),
+                    file_name=nm,
                     reply_to=new_tid)
                 meta['kind'] = 'photo' if mtype == 'MessageMediaPhoto' else mtype
                 return 'done', sent.id, meta
