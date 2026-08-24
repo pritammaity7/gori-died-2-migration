@@ -1,0 +1,216 @@
+"""Gori Died 2 -> My Courses migration worker.
+
+Runs in GitHub Action (max ~48 min budget). Per-topic cursor state lives in the
+Cloudflare panel worker's D1 database, updated after EVERY message, so a crash
+never duplicates or skips anything. Order: oldest -> newest per topic.
+
+Env: TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION (StringSession),
+     OLD_CHAT_ID, NEW_CHAT_ID, WORKER_URL, MIGRATE_KEY, TIME_BUDGET_MIN
+"""
+import asyncio, os, sys, time, json
+import requests
+from telethon import TelegramClient, errors
+from telethon.tl.functions.messages import GetForumTopicsRequest, CreateForumTopicRequest
+from telethon.tl.types import InputReplyToMessage
+
+API_ID = int(os.environ['TELEGRAM_API_ID'])
+API_HASH = os.environ['TELEGRAM_API_HASH']
+SESSION = os.environ['TELEGRAM_SESSION']
+OLD_ID = int(os.environ['OLD_CHAT_ID'])
+NEW_ID = int(os.environ['NEW_CHAT_ID'])
+WORKER = os.environ['WORKER_URL'].rstrip('/')
+KEY = os.environ['MIGRATE_KEY']
+BUDGET_MIN = float(os.environ.get('TIME_BUDGET_MIN', '48'))
+TMP = '/tmp/mig_media.bin'
+START = time.time()
+
+HDRS = {'x-migrate-key': KEY, 'content-type': 'application/json'}
+
+
+def api_get(path):
+    r = requests.get(WORKER + path, headers=HDRS, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def api_post(path, payload):
+    for attempt in range(4):
+        try:
+            r = requests.post(WORKER + path, headers=HDRS, data=json.dumps(payload), timeout=30)
+            if r.status_code == 200:
+                return r.json()
+        except Exception as e:
+            print(f'   worker post retry {attempt}: {e}')
+        time.sleep(3 * (attempt + 1))
+    print('   [WARN] worker unreachable, continuing (state may replay)')
+    return {}
+
+
+def remaining():
+    return BUDGET_MIN * 60 - (time.time() - START)
+
+
+def is_video(doc):
+    return any(type(a).__name__ == 'DocumentAttributeVideo' for a in doc.attributes)
+
+
+async def seed_topics(client, old):
+    """Fetch all topics from old group, keep CLOSED ones only, push to D1."""
+    topics, offset_topic, offset_date, offset_id = [], 0, None, 0
+    while True:
+        res = await client(GetForumTopicsRequest(
+            peer=old, offset_date=offset_date, offset_id=offset_id,
+            offset_topic=offset_topic, limit=100))
+        if not res.topics:
+            break
+        topics.extend(res.topics)
+        offset_topic = res.topics[-1].id
+        offset_date = getattr(res.topics[-1], 'date', None)
+        offset_id = res.topics[-1].top_message
+        if len(res.topics) < 100:
+            break
+    closed = [{'root_id': t.id, 'title': getattr(t, 'title', f'topic-{t.id}'), 'closed': True}
+              for t in topics if t.closed]
+    print(f'[SEED] {len(topics)} topics total, {len(closed)} closed -> migrating these')
+    api_post('/api/seed', {'topics': closed})
+    return closed
+
+
+async def ensure_new_topic(client, new, row):
+    """Create matching topic in new group once; returns new root msg id."""
+    if row.get('new_topic_id'):
+        return row['new_topic_id']
+    res = await client(CreateForumTopicRequest(
+        peer=new, title=row['title'],
+        random_id=int.from_bytes(os.urandom(8), 'big', signed=True)))
+    new_id = None
+    for u in res.updates:
+        msg = getattr(u, 'message', None)
+        if msg is not None:
+            new_id = msg.id
+            break
+    print(f'   [TOPIC] created {row["title"]!r} -> root {new_id}')
+    api_post('/api/update', {'topic_root': row['old_root'], 'cursor': row.get('cursor', 0),
+                             'new_topic_id': new_id})
+    return new_id
+
+async def process_message(client, new, m, new_tid, row):
+    """Copy one old message into the new topic. Returns (status, new_msg_id, meta)."""
+    meta = {'old_msg_id': m.id, 'caption': (m.message or ''), 'kind': 'text',
+            'file_name': '', 'size': 0}
+    if m.action and not m.media:
+        return 'skipped', None, meta  # service messages (joins, pins, edits)
+
+    if m.media and m.document:
+        doc = m.document
+        size = doc.size or 0
+        fn = next((getattr(a, 'file_name', '') for a in doc.attributes
+                   if hasattr(a, 'file_name')), '')
+        meta.update(kind='video' if is_video(doc) else 'document',
+                    file_name=fn, size=size)
+        if size > 1950 * 1024 * 1024:
+            return 'skipped', None, meta  # over Telegram 2GB upload cap
+        path = await client.download_media(m, file=TMP)
+        try:
+            vid = is_video(doc)
+            sent = await client.send_file(
+                new, path, caption=(m.message or None),
+                reply_to=InputReplyToMessage(reply_to_msg_id=new_tid),
+                supports_streaming=vid, force_document=not vid)
+            return 'done', sent.id, meta
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    elif m.media:
+        path = await client.download_media(m, file=TMP)
+        try:
+            sent = await client.send_file(
+                new, path, caption=(m.message or None),
+                reply_to=InputReplyToMessage(reply_to_msg_id=new_tid))
+            meta['kind'] = 'photo'
+            return 'done', sent.id, meta
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    else:
+        sent = await client.send_message(
+            new, m.message or '', formatting_entities=m.entities or None,
+            reply_to=InputReplyToMessage(reply_to_msg_id=new_tid))
+        return 'done', sent.id, meta
+    return 'skipped', None, meta
+
+async def main():
+    client = TelegramClient(StringSessionHolder(), API_ID, API_HASH)
+    await client.connect()
+    if not await client.is_user_authorized():
+        print('[FATAL] session invalid')
+        sys.exit(1)
+    me = await client.get_me()
+    old = await client.get_entity(OLD_ID)
+    new = await client.get_entity(NEW_ID)
+    print(f'[OK] {me.first_name} | old={old.title!r} new={new.title!r} | budget {BUDGET_MIN} min')
+
+    st = api_get('/api/state')
+    if not st.get('topics'):
+        await seed_topics(client, old)
+        st = api_get('/api/state')
+
+    for row in st['topics']:
+        if remaining() < 180:
+            print('[TIME] budget nearly over, stopping cleanly')
+            break
+        root = row['old_root']
+        cursor = row.get('cursor') or 0
+        print(f"\n=== TOPIC {row['title']!r} (root={root}, cursor={cursor}) ===")
+        new_tid = await ensure_new_topic(client, new, row)
+        if not new_tid:
+            print('   [WARN] no new topic id, skipping topic')
+            continue
+
+        count = 0
+        try:
+            it = client.iter_messages(old, reply_to=root, reverse=True, min_id=cursor)
+            async for m in it:
+                if remaining() < 120:
+                    print('[TIME] stopping mid-topic; cursor already safe')
+                    return
+                if m.id <= cursor:
+                    continue
+                try:
+                    status, new_mid, meta = await process_message(client, new, m, new_tid, row)
+                except errors.FloodWaitError as e:
+                    wait = min(e.seconds + 2, max(0, remaining() - 60))
+                    if wait <= 0:
+                        print('[TIME] floodwait beyond budget, exiting')
+                        return
+                    print(f'   [FLOODWAIT] {e.seconds}s')
+                    await asyncio.sleep(wait)
+                    continue
+                except Exception as e:
+                    print(f'   [ERR] msg {m.id}: {type(e).__name__}: {e}')
+                    api_post('/api/update', {'topic_root': root, 'cursor': m.id,
+                                             'old_msg_id': m.id, 'status': 'failed'})
+                    continue
+
+                payload = {'topic_root': root, 'cursor': m.id, 'status': status,
+                           'new_msg_id': new_mid, **meta}
+                api_post('/api/update', payload)
+                count += 1
+                if count % 10 == 0:
+                    print(f'   ... {count} msgs (at id {m.id}, {remaining():.0f}s left)')
+        except Exception as e:
+            print(f'   [TOPIC ERR] {type(e).__name__}: {e} (moving on)')
+    print('\n[DONE] run complete')
+
+
+def StringSessionHolder():
+    from telethon.sessions import StringSession
+    return StringSession(SESSION)
+
+
+asyncio.run(main())
+
