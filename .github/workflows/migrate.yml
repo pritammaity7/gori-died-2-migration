@@ -1,0 +1,34 @@
+name: Telegram Migration (Gori Died 2)
+
+on:
+  repository_dispatch:
+    types: [migrate]
+  workflow_dispatch:
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 59
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run migration chunk
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+          OLD_CHAT_ID: ${{ secrets.OLD_CHAT_ID }}
+          NEW_CHAT_ID: ${{ secrets.NEW_CHAT_ID }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          MIGRATE_KEY: ${{ secrets.MIGRATE_KEY }}
+          TIME_BUDGET_MIN: '48'
+        run: python migrate.py
