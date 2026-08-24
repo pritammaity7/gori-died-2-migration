@@ -1,4 +1,4 @@
-"""Gori Died 2 -> My Courses migration worker.
+﻿"""Gori Died 2 -> My Courses migration worker.
 
 Runs in GitHub Action (max ~48 min budget). Per-topic cursor state lives in the
 Cloudflare panel worker's D1 database, updated after EVERY message, so a crash
@@ -11,7 +11,6 @@ import asyncio, os, sys, time, json
 import requests
 from telethon import TelegramClient, errors
 from telethon.tl.functions.messages import GetForumTopicsRequest, CreateForumTopicRequest
-from telethon.tl.types import InputReplyToMessage
 
 API_ID = int(os.environ['TELEGRAM_API_ID'])
 API_HASH = os.environ['TELEGRAM_API_HASH']
@@ -101,7 +100,10 @@ async def process_message(client, new, m, new_tid, row):
     if m.action and not m.media:
         return 'skipped', None, meta  # service messages (joins, pins, edits)
 
-    if m.media and m.document:
+    text = m.message or ''
+    mtype = type(m.media).__name__ if m.media else ''
+
+    if m.document:
         doc = m.document
         size = doc.size or 0
         fn = next((getattr(a, 'file_name', '') for a in doc.attributes
@@ -111,37 +113,55 @@ async def process_message(client, new, m, new_tid, row):
         if size > 1950 * 1024 * 1024:
             return 'skipped', None, meta  # over Telegram 2GB upload cap
         path = await client.download_media(m, file=TMP)
-        try:
-            vid = is_video(doc)
-            sent = await client.send_file(
-                new, path, caption=(m.message or None),
-                reply_to=InputReplyToMessage(reply_to_msg_id=new_tid),
-                supports_streaming=vid, force_document=not vid)
-            return 'done', sent.id, meta
-        finally:
+        if path:
             try:
-                os.remove(path)
-            except OSError:
-                pass
+                vid = is_video(doc)
+                sent = await client.send_file(
+                    new, path, caption=(text or None),
+                    reply_to=new_tid,
+                    supports_streaming=vid, force_document=not vid)
+                return 'done', sent.id, meta
+            finally:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+    elif mtype == 'MessageMediaWebPage':
+        pass  # just a link preview - send as plain text below
+    elif mtype == 'MessageMediaPoll':
+        poll = m.media.poll
+        q = ''
+        try:
+            q = poll.question.text if hasattr(poll.question, 'text') else str(poll.question)
+        except Exception:
+            q = ''
+        out = (text + f'\n[poll: {q}]').strip() or f'[poll: {q}]'
+        sent = await client.send_message(
+            new, out, reply_to=new_tid)
+        meta.update(kind='poll', caption=out)
+        return 'done', sent.id, meta
     elif m.media:
         path = await client.download_media(m, file=TMP)
-        try:
-            sent = await client.send_file(
-                new, path, caption=(m.message or None),
-                reply_to=InputReplyToMessage(reply_to_msg_id=new_tid))
-            meta['kind'] = 'photo'
-            return 'done', sent.id, meta
-        finally:
+        if path:
             try:
-                os.remove(path)
-            except OSError:
-                pass
-    else:
-        sent = await client.send_message(
-            new, m.message or '', formatting_entities=m.entities or None,
-            reply_to=InputReplyToMessage(reply_to_msg_id=new_tid))
-        return 'done', sent.id, meta
-    return 'skipped', None, meta
+                sent = await client.send_file(
+                    new, path, caption=(text or None),
+                    reply_to=new_tid)
+                meta['kind'] = 'photo' if mtype == 'MessageMediaPhoto' else mtype
+                return 'done', sent.id, meta
+            finally:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    text = text.strip()
+    if not text:
+        return 'skipped', None, meta  # nothing copyable in this message
+    sent = await client.send_message(
+        new, text, formatting_entities=m.entities or None,
+        reply_to=new_tid)
+    return 'done', sent.id, meta
 
 async def main():
     client = TelegramClient(StringSessionHolder(), API_ID, API_HASH)
