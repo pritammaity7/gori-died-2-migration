@@ -199,13 +199,14 @@ async def main():
             continue
 
         count = 0
+        done_ids = set(row.get('done_ids') or [])
         try:
             it = client.iter_messages(old, reply_to=root, reverse=True, min_id=cursor)
             async for m in it:
                 if remaining() < 120:
                     print('[TIME] stopping mid-topic; cursor already safe')
                     return
-                if m.id <= cursor:
+                if m.id <= cursor or m.id in done_ids:
                     continue
                 try:
                     status, new_mid, meta = await process_message(client, new, m, new_tid, row)
@@ -219,8 +220,15 @@ async def main():
                     continue
                 except Exception as e:
                     print(f'   [ERR] msg {m.id}: {type(e).__name__}: {e}')
-                    api_post('/api/update', {'topic_root': root, 'cursor': m.id,
-                                             'old_msg_id': m.id, 'status': 'failed'})
+                    fmeta = {'topic_root': root, 'cursor': m.id, 'old_msg_id': m.id,
+                             'status': 'failed', 'kind': 'unknown', 'file_name': '',
+                             'caption': (m.message or '')[:200]}
+                    if m.document:
+                        fmeta['kind'] = 'document'
+                        fmeta['file_name'] = next((getattr(a, 'file_name', '') for a in m.document.attributes
+                                                   if hasattr(a, 'file_name')), '')
+                        fmeta['size'] = m.document.size or 0
+                    api_post('/api/update', fmeta)
                     continue
 
                 payload = {'topic_root': root, 'cursor': m.id, 'status': status,
