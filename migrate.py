@@ -284,11 +284,3 @@ def StringSessionHolder():
 
 asyncio.run(main())
 
-
-def StringSessionHolder():
-    from telethon.sessions import StringSession
-    return StringSession(SESSION)
-
-
-asyncio.run(main())
-
