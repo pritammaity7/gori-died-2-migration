@@ -29,6 +29,11 @@ jobs:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+          TELEGRAM_SESSION_0: ${{ secrets.TELEGRAM_SESSION_0 }}
+          TELEGRAM_SESSION_1: ${{ secrets.TELEGRAM_SESSION_1 }}
+          TELEGRAM_SESSION_2: ${{ secrets.TELEGRAM_SESSION_2 }}
+          TELEGRAM_SESSION_3: ${{ secrets.TELEGRAM_SESSION_3 }}
+          TELEGRAM_SESSION_4: ${{ secrets.TELEGRAM_SESSION_4 }}
           OLD_CHAT_ID: ${{ secrets.OLD_CHAT_ID }}
           NEW_CHAT_ID: ${{ secrets.NEW_CHAT_ID }}
           WORKER_URL: ${{ secrets.WORKER_URL }}
