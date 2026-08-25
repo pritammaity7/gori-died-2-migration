@@ -20,7 +20,8 @@ NEW_ID = int(os.environ['NEW_CHAT_ID'])
 WORKER = os.environ['WORKER_URL'].rstrip('/')
 KEY = os.environ['MIGRATE_KEY']
 BUDGET_MIN = float(os.environ.get('TIME_BUDGET_MIN', '48'))
-TMP = '/tmp/mig_media.bin'
+SHARD = os.environ.get('SHARD', 'manual')
+WORKER_ID = 'shard-' + SHARD + '-' + str(os.getpid())
 DL_DIR = '/tmp/migdl'
 START = time.time()
 
@@ -170,6 +171,18 @@ async def process_message(client, new, m, new_tid, row):
         reply_to=new_tid)
     return 'done', sent.id, meta
 
+async def count_totals(client, old, root):
+    """One-time walk: count copyable messages + media in a topic (for 'left' counters)."""
+    total = media = 0
+    async for m in client.iter_messages(old, reply_to=root, reverse=True):
+        if m.action and not m.media:
+            continue
+        total += 1
+        if m.document or m.photo:
+            media += 1
+    return total, media
+
+
 async def main():
     client = TelegramClient(StringSessionHolder(), API_ID, API_HASH)
     await client.connect()
@@ -179,67 +192,97 @@ async def main():
     me = await client.get_me()
     old = await client.get_entity(OLD_ID)
     new = await client.get_entity(NEW_ID)
-    print(f'[OK] {me.first_name} | old={old.title!r} new={new.title!r} | budget {BUDGET_MIN} min')
+    print(f'[OK] {me.first_name} | worker={WORKER_ID} | budget {BUDGET_MIN} min')
 
     st = api_get('/api/state')
     if not st.get('topics'):
         await seed_topics(client, old)
-        st = api_get('/api/state')
 
-    for row in st['topics']:
-        if remaining() < 180:
-            print('[TIME] budget nearly over, stopping cleanly')
+    topics_done = 0
+    while remaining() > 300:
+        c = api_post('/api/claim', {'worker_id': WORKER_ID})
+        t = c.get('topic')
+        if not t:
+            print('[CLAIM] nothing left to migrate - all caught up')
             break
-        root = row['old_root']
-        cursor = row.get('cursor') or 0
-        print(f"\n=== TOPIC {row['title']!r} (root={root}, cursor={cursor}) ===")
-        new_tid = await ensure_new_topic(client, new, row)
-        if not new_tid:
-            print('   [WARN] no new topic id, skipping topic')
-            continue
+        root = t['old_root']
+        cursor = t.get('cursor') or 0
+        done_ids = set(c.get('done_ids') or [])
+        print(f"\n=== CLAIMED {t['title']!r} (root={root}, cursor={cursor}, done_ids={len(done_ids)}) ===")
 
-        count = 0
-        done_ids = set(row.get('done_ids') or [])
         try:
-            it = client.iter_messages(old, reply_to=root, reverse=True, min_id=cursor)
-            async for m in it:
-                if remaining() < 120:
-                    print('[TIME] stopping mid-topic; cursor already safe')
-                    return
-                if m.id <= cursor or m.id in done_ids:
-                    continue
-                try:
-                    status, new_mid, meta = await process_message(client, new, m, new_tid, row)
-                except errors.FloodWaitError as e:
-                    wait = min(e.seconds + 2, max(0, remaining() - 60))
-                    if wait <= 0:
-                        print('[TIME] floodwait beyond budget, exiting')
-                        return
-                    print(f'   [FLOODWAIT] {e.seconds}s')
-                    await asyncio.sleep(wait)
-                    continue
-                except Exception as e:
-                    print(f'   [ERR] msg {m.id}: {type(e).__name__}: {e}')
-                    fmeta = {'topic_root': root, 'cursor': m.id, 'old_msg_id': m.id,
-                             'status': 'failed', 'kind': 'unknown', 'file_name': '',
-                             'caption': (m.message or '')[:200]}
-                    if m.document:
-                        fmeta['kind'] = 'document'
-                        fmeta['file_name'] = next((getattr(a, 'file_name', '') for a in m.document.attributes
-                                                   if hasattr(a, 'file_name')), '')
-                        fmeta['size'] = m.document.size or 0
-                    api_post('/api/update', fmeta)
-                    continue
+            new_tid = await ensure_new_topic(client, new, t)
+            if not new_tid:
+                print('   [WARN] no new topic id, releasing')
+                continue
 
-                payload = {'topic_root': root, 'cursor': m.id, 'status': status,
-                           'new_msg_id': new_mid, **meta}
-                api_post('/api/update', payload)
-                count += 1
-                if count % 10 == 0:
-                    print(f'   ... {count} msgs (at id {m.id}, {remaining():.0f}s left)')
+            if t.get('total_msgs') is None:
+                if remaining() < 600:
+                    print('[TIME] not enough budget to scan a new topic, releasing')
+                    continue
+                total, media = await count_totals(client, old, root)
+                api_post('/api/totals', {'topic_root': root, 'total_msgs': total, 'total_media': media})
+                print(f'   [COUNT] {total} copyable msgs, {media} media')
+
+            count = 0
+            last_hb = time.time()
+            try:
+                it = client.iter_messages(old, reply_to=root, reverse=True, min_id=cursor)
+                async for m in it:
+                    if remaining() < 120:
+                        print('[TIME] stopping mid-topic; cursor already safe')
+                        return
+                    if time.time() - last_hb > 240:
+                        api_post('/api/heartbeat', {'topic_root': root, 'worker_id': WORKER_ID})
+                        last_hb = time.time()
+                    if m.id <= cursor or m.id in done_ids:
+                        continue
+                    try:
+                        status, new_mid, meta = await process_message(client, new, m, new_tid, t)
+                    except errors.FloodWaitError as e:
+                        wait = min(e.seconds + 2, max(0, remaining() - 60))
+                        if wait <= 0:
+                            print('[TIME] floodwait beyond budget, exiting')
+                            return
+                        print(f'   [FLOODWAIT] {e.seconds}s')
+                        await asyncio.sleep(wait)
+                        continue
+                    except Exception as e:
+                        print(f'   [ERR] msg {m.id}: {type(e).__name__}: {str(e)[:120]}')
+                        fmeta = {'topic_root': root, 'cursor': m.id, 'old_msg_id': m.id,
+                                 'status': 'failed', 'kind': 'unknown', 'file_name': '',
+                                 'caption': (m.message or '')[:200]}
+                        if m.document:
+                            fmeta['kind'] = 'document'
+                            fmeta['file_name'] = next((getattr(a, 'file_name', '') for a in m.document.attributes
+                                                       if hasattr(a, 'file_name')), '')
+                            fmeta['size'] = m.document.size or 0
+                        api_post('/api/update', fmeta)
+                        continue
+
+                    payload = {'topic_root': root, 'cursor': m.id, 'status': status,
+                               'new_msg_id': new_mid, **meta}
+                    api_post('/api/update', payload)
+                    count += 1
+                    if count % 10 == 0:
+                        print(f'   ... {count} msgs (at id {m.id}, {remaining():.0f}s left)')
+                topics_done += 1
+                print(f'   [TOPIC COMPLETE] {count} msgs this run')
+            finally:
+                api_post('/api/release', {'topic_root': root, 'worker_id': WORKER_ID})
         except Exception as e:
-            print(f'   [TOPIC ERR] {type(e).__name__}: {e} (moving on)')
-    print('\n[DONE] run complete')
+            print(f'   [TOPIC ERR] {type(e).__name__}: {e} (releasing, moving on)')
+            api_post('/api/release', {'topic_root': root, 'worker_id': WORKER_ID})
+
+    print(f'\n[DONE] worker {WORKER_ID} finished, {topics_done} topics fully processed')
+
+
+def StringSessionHolder():
+    from telethon.sessions import StringSession
+    return StringSession(SESSION)
+
+
+asyncio.run(main())
 
 
 def StringSessionHolder():
