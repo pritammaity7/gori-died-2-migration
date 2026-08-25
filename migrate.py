@@ -321,6 +321,28 @@ async def count_totals(client, old, root):
     return total, media
 
 
+async def count_totals_full(client, old, root):
+    """Extended walk: also sums bytes and splits video/doc/photo counts."""
+    total = media = videos = docs = photos = 0
+    total_bytes = 0
+    async for m in client.iter_messages(old, reply_to=root, reverse=True):
+        if m.action and not m.media:
+            continue
+        total += 1
+        if m.document:
+            media += 1
+            total_bytes += m.document.size or 0
+            if is_video(m.document):
+                videos += 1
+            else:
+                docs += 1
+        elif m.photo:
+            media += 1
+            photos += 1
+    return {'total_msgs': total, 'total_media': media, 'total_bytes': total_bytes,
+            'total_videos': videos, 'total_docs': docs, 'total_photos': photos}
+
+
 async def main():
     client = TelegramClient(StringSessionHolder(), API_ID, API_HASH)
     await client.connect()
@@ -337,8 +359,10 @@ async def main():
     print(f'[OK] {me.first_name} | worker={WORKER_ID} | budget {BUDGET_MIN} min')
 
     st = api_get('/api/state')
-    if not st.get('topics'):
-        await seed_topics(client, old)
+    # ALWAYS re-seed: refreshes top_msg for known topics (catches new messages
+    # appended to old topics) and discovers newly-closed topics (patrol mode).
+    await seed_topics(client, old)
+    st = api_get('/api/state')
 
     topics_done = 0
     while remaining() > 300:
@@ -367,9 +391,11 @@ async def main():
                 if remaining() < 600:
                     print('[TIME] not enough budget to scan a new topic, releasing')
                     continue
-                total, media = await count_totals(client, old, root)
-                api_post('/api/totals', {'topic_root': root, 'total_msgs': total, 'total_media': media})
-                print(f'   [COUNT] {total} copyable msgs, {media} media')
+                stats = await count_totals_full(client, old, root)
+                api_post('/api/totals', {'topic_root': root, **stats})
+                print(f"   [COUNT] {stats['total_msgs']} copyable msgs, "
+                      f"{stats['total_media']} media, {stats['total_bytes']/1073741824:.2f} GB "
+                      f"({stats['total_videos']} videos / {stats['total_docs']} files / {stats['total_photos']} photos)")
 
             count = 0
             last_hb = time.time()
