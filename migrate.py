@@ -14,13 +14,25 @@ from telethon.tl.functions.messages import GetForumTopicsRequest, CreateForumTop
 
 API_ID = int(os.environ['TELEGRAM_API_ID'])
 API_HASH = os.environ['TELEGRAM_API_HASH']
-SESSION = os.environ['TELEGRAM_SESSION']
+SHARD = os.environ.get('SHARD', 'manual')
+
+
+def _pick_session():
+    """Each shard maps to its own Telegram account/session secret."""
+    for k in (f'TELEGRAM_SESSION_{SHARD}', 'TELEGRAM_SESSION'):
+        v = os.environ.get(k)
+        if v and not v.startswith('PENDING'):
+            return v
+    print(f'[FATAL] no session secret for SHARD={SHARD}')
+    sys.exit(1)
+
+
+SESSION = _pick_session()
 OLD_ID = int(os.environ['OLD_CHAT_ID'])
 NEW_ID = int(os.environ['NEW_CHAT_ID'])
 WORKER = os.environ['WORKER_URL'].rstrip('/')
 KEY = os.environ['MIGRATE_KEY']
 BUDGET_MIN = float(os.environ.get('TIME_BUDGET_MIN', '48'))
-SHARD = os.environ.get('SHARD', 'manual')
 WORKER_ID = 'shard-' + SHARD + '-' + str(os.getpid())
 DL_DIR = '/tmp/migdl'
 START = time.time()
@@ -94,6 +106,48 @@ async def smart_download(client, msg, path):
         except OSError:
             pass
     return await client.download_media(msg, file=path)
+
+
+class MsgBatch:
+    """Buffers per-message updates, flushes via /api/bulk.
+    - flush at >=10 items or 30s age (keeps Cloudflare/D1 daily limits safe)
+    - expensive transfers flush immediately for crash-durability
+    - always flush before releasing a topic"""
+
+    BATCH_N = 10
+    BATCH_SECS = 30
+    BIG = 5 * 1024 * 1024
+
+    def __init__(self, topic_root):
+        self.topic_root = topic_root
+        self.items = []
+        self.last = time.time()
+
+    def add(self, item):
+        self.items.append(item)
+
+    def is_big(self, item):
+        return (item.get('size') or 0) >= self.BIG or \
+               item.get('kind') in ('video', 'document', 'photo', 'poll')
+
+    async def maybe_flush(self, item=None):
+        if item is not None and self.is_big(item):
+            await self.flush()
+            return
+        if len(self.items) >= self.BATCH_N or (self.items and time.time() - self.last >= self.BATCH_SECS):
+            await self.flush()
+
+    async def flush(self):
+        if not self.items:
+            return
+        n = len(self.items)
+        r = api_post('/api/bulk', {'topic_root': self.topic_root, 'items': self.items})
+        self.items.clear()
+        self.last = time.time()
+        if not r.get('ok'):
+            print(f'   [BULK WARN] {n} updates may need replay: {str(r)[:120]}')
+        else:
+            print(f'   [BULK] {n} updates flushed')
 
 
 async def fast_upload_and_send(client, peer, path, src_msg, reply_to, caption):
@@ -274,6 +328,10 @@ async def main():
         print('[FATAL] session invalid')
         sys.exit(1)
     me = await client.get_me()
+    acct = f"{(me.first_name or '?').strip()[:14]}|{me.phone or me.id}"
+    global WORKER_ID
+    WORKER_ID = f'{acct}-s{SHARD}-{os.getpid()}'[:80]
+    print(f'[ACCOUNT] {acct} | shard={SHARD}')
     old = await client.get_entity(OLD_ID)
     new = await client.get_entity(NEW_ID)
     print(f'[OK] {me.first_name} | worker={WORKER_ID} | budget {BUDGET_MIN} min')
@@ -303,6 +361,8 @@ async def main():
                 print('   [WARN] no new topic id, releasing')
                 continue
 
+            batch = MsgBatch(root)
+
             if t.get('total_msgs') is None:
                 if remaining() < 600:
                     print('[TIME] not enough budget to scan a new topic, releasing')
@@ -320,9 +380,11 @@ async def main():
                 async for m in it:
                     if remaining() < 120:
                         print('[TIME] stopping mid-topic; cursor already safe')
+                        await batch.flush()
                         return
                     last_seen = max(last_seen, m.id)
                     if time.time() - last_hb > 240:
+                        await batch.flush()          # keep cursor durable before idle heartbeat
                         api_post('/api/heartbeat', {'topic_root': root, 'worker_id': WORKER_ID})
                         last_hb = time.time()
                     if m.id <= cursor or m.id in done_ids or m.id in failed_ids:
@@ -337,47 +399,51 @@ async def main():
                         sz = getattr(getattr(m, 'document', None), 'size', 0) or 0
                         print(f'   [WATCHDOG] msg {m.id} exceeded {PER_MSG_TIMEOUT}s '
                               f'({sz/1024/1024:.0f}MB) - marking failed, moving on')
-                        fmeta = {'topic_root': root, 'cursor': m.id, 'old_msg_id': m.id,
-                                 'status': 'failed', 'kind': 'unknown',
-                                 'file_name': 'watchdog-timeout',
-                                 'caption': (m.message or '')[:200]}
-                        api_post('/api/update', fmeta)
+                        batch.add({'old_msg_id': m.id, 'cursor': m.id, 'status': 'failed',
+                                   'kind': 'unknown', 'file_name': 'watchdog-timeout',
+                                   'caption': (m.message or '')[:200]})
+                        await batch.maybe_flush()
                         continue
                     except errors.FloodWaitError as e:
                         wait = min(e.seconds + 2, max(0, remaining() - 60))
                         if wait <= 0:
                             print('[TIME] floodwait beyond budget, exiting')
+                            await batch.flush()
                             return
                         print(f'   [FLOODWAIT] {e.seconds}s')
                         await asyncio.sleep(wait)
                         continue
                     except Exception as e:
                         print(f'   [ERR] msg {m.id}: {type(e).__name__}: {str(e)[:120]}')
-                        fmeta = {'topic_root': root, 'cursor': m.id, 'old_msg_id': m.id,
-                                 'status': 'failed', 'kind': 'unknown', 'file_name': '',
-                                 'caption': (m.message or '')[:200]}
+                        item = {'old_msg_id': m.id, 'cursor': m.id, 'status': 'failed',
+                                'kind': 'unknown', 'file_name': '',
+                                'caption': (m.message or '')[:200]}
                         if m.document:
-                            fmeta['kind'] = 'document'
-                            fmeta['file_name'] = next((getattr(a, 'file_name', '') for a in m.document.attributes
-                                                       if hasattr(a, 'file_name')), '')
-                            fmeta['size'] = m.document.size or 0
-                        api_post('/api/update', fmeta)
+                            item['kind'] = 'document'
+                            item['file_name'] = next((getattr(a, 'file_name', '') for a in m.document.attributes
+                                                      if hasattr(a, 'file_name')), '')
+                            item['size'] = m.document.size or 0
+                        batch.add(item)
+                        await batch.maybe_flush(item)
                         continue
 
-                    payload = {'topic_root': root, 'cursor': m.id, 'status': status,
+                    payload = {'old_msg_id': m.id, 'cursor': m.id, 'status': status,
                                'new_msg_id': new_mid, **meta}
-                    api_post('/api/update', payload)
+                    batch.add(payload)
                     count += 1
-                    if count % 10 == 0:
+                    if count % 25 == 0:
                         print(f'   ... {count} msgs (at id {m.id}, {remaining():.0f}s left)')
+                    await batch.maybe_flush(payload)
                 topics_done += 1
                 print(f'   [TOPIC COMPLETE] {count} msgs this run')
                 if is_general and last_seen > cursor:
                     # reached the true end of the group chat -> close out the row
+                    await batch.flush()
                     api_post('/api/update', {'topic_root': root, 'cursor': last_seen,
                                              'top_message': last_seen})
                     print(f'   [GENERAL SEALED] top_msg={last_seen}')
             finally:
+                await batch.flush()
                 api_post('/api/release', {'topic_root': root, 'worker_id': WORKER_ID})
         except Exception as e:
             print(f'   [TOPIC ERR] {type(e).__name__}: {e} (releasing, moving on)')
