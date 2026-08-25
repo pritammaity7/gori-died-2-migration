@@ -24,6 +24,8 @@ SHARD = os.environ.get('SHARD', 'manual')
 WORKER_ID = 'shard-' + SHARD + '-' + str(os.getpid())
 DL_DIR = '/tmp/migdl'
 START = time.time()
+# A single message (download+upload of one file) must never hang the whole run.
+PER_MSG_TIMEOUT = float(os.environ.get('PER_MSG_TIMEOUT', '900'))  # 15 min
 
 HDRS = {'x-migrate-key': KEY, 'content-type': 'application/json'}
 
@@ -208,7 +210,9 @@ async def main():
         root = t['old_root']
         cursor = t.get('cursor') or 0
         done_ids = set(c.get('done_ids') or [])
-        print(f"\n=== CLAIMED {t['title']!r} (root={root}, cursor={cursor}, done_ids={len(done_ids)}) ===")
+        failed_ids = set(c.get('failed_ids') or [])
+        print(f"\n=== CLAIMED {t['title']!r} (root={root}, cursor={cursor}, "
+              f"done_ids={len(done_ids)}, failed_skip={len(failed_ids)}) ===")
 
         try:
             new_tid = await ensure_new_topic(client, new, t)
@@ -235,10 +239,22 @@ async def main():
                     if time.time() - last_hb > 240:
                         api_post('/api/heartbeat', {'topic_root': root, 'worker_id': WORKER_ID})
                         last_hb = time.time()
-                    if m.id <= cursor or m.id in done_ids:
+                    if m.id <= cursor or m.id in done_ids or m.id in failed_ids:
                         continue
                     try:
-                        status, new_mid, meta = await process_message(client, new, m, new_tid, t)
+                        # watchdog: a single message must never hang the whole run
+                        status, new_mid, meta = await asyncio.wait_for(
+                            process_message(client, new, m, new_tid, t), timeout=PER_MSG_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        sz = getattr(getattr(m, 'document', None), 'size', 0) or 0
+                        print(f'   [WATCHDOG] msg {m.id} exceeded {PER_MSG_TIMEOUT}s '
+                              f'({sz/1024/1024:.0f}MB) - marking failed, moving on')
+                        fmeta = {'topic_root': root, 'cursor': m.id, 'old_msg_id': m.id,
+                                 'status': 'failed', 'kind': 'unknown',
+                                 'file_name': 'watchdog-timeout',
+                                 'caption': (m.message or '')[:200]}
+                        api_post('/api/update', fmeta)
+                        continue
                     except errors.FloodWaitError as e:
                         wait = min(e.seconds + 2, max(0, remaining() - 60))
                         if wait <= 0:
