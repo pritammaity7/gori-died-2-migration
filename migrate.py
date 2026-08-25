@@ -53,6 +53,19 @@ def remaining():
     return BUDGET_MIN * 60 - (time.time() - START)
 
 
+def topic_is_forum_topic(m):
+    """True if this message lives inside a named forum topic (not the General area)."""
+    rt = getattr(m, 'reply_to', None)
+    if rt is None:
+        return False
+    top = getattr(rt, 'reply_to_top_id', None)
+    if top:
+        return True
+    rid = getattr(rt, 'reply_to_msg_id', 0)
+    # bare reply_to_msg_id==1 (or a service marker) means the General area
+    return rid not in (0, 1)
+
+
 def is_video(doc):
     return any(type(a).__name__ == 'DocumentAttributeVideo' for a in doc.attributes)
 
@@ -211,6 +224,7 @@ async def main():
         cursor = t.get('cursor') or 0
         done_ids = set(c.get('done_ids') or [])
         failed_ids = set(c.get('failed_ids') or [])
+        is_general = (root == -1)   # special row: whole-group chat outside topics
         print(f"\n=== CLAIMED {t['title']!r} (root={root}, cursor={cursor}, "
               f"done_ids={len(done_ids)}, failed_skip={len(failed_ids)}) ===")
 
@@ -230,17 +244,22 @@ async def main():
 
             count = 0
             last_hb = time.time()
+            last_seen = cursor
             try:
-                it = client.iter_messages(old, reply_to=root, reverse=True, min_id=cursor)
+                it = client.iter_messages(old, reply_to=None if is_general else root,
+                                          reverse=True, min_id=cursor)
                 async for m in it:
                     if remaining() < 120:
                         print('[TIME] stopping mid-topic; cursor already safe')
                         return
+                    last_seen = max(last_seen, m.id)
                     if time.time() - last_hb > 240:
                         api_post('/api/heartbeat', {'topic_root': root, 'worker_id': WORKER_ID})
                         last_hb = time.time()
                     if m.id <= cursor or m.id in done_ids or m.id in failed_ids:
                         continue
+                    if is_general and topic_is_forum_topic(m):
+                        continue  # belongs to a real topic - handled by its own claim
                     try:
                         # watchdog: a single message must never hang the whole run
                         status, new_mid, meta = await asyncio.wait_for(
@@ -284,6 +303,11 @@ async def main():
                         print(f'   ... {count} msgs (at id {m.id}, {remaining():.0f}s left)')
                 topics_done += 1
                 print(f'   [TOPIC COMPLETE] {count} msgs this run')
+                if is_general and last_seen > cursor:
+                    # reached the true end of the group chat -> close out the row
+                    api_post('/api/update', {'topic_root': root, 'cursor': last_seen,
+                                             'top_message': last_seen})
+                    print(f'   [GENERAL SEALED] top_msg={last_seen}')
             finally:
                 api_post('/api/release', {'topic_root': root, 'worker_id': WORKER_ID})
         except Exception as e:
