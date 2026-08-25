@@ -27,6 +27,11 @@ START = time.time()
 # A single message (download+upload of one file) must never hang the whole run.
 PER_MSG_TIMEOUT = float(os.environ.get('PER_MSG_TIMEOUT', '900'))  # 15 min
 
+try:
+    import fast_telethon as FT          # vendored parallel-transfer module
+except Exception:
+    FT = None                           # silently degrade to standard transfers
+
 HDRS = {'x-migrate-key': KEY, 'content-type': 'application/json'}
 
 
@@ -64,6 +69,63 @@ def topic_is_forum_topic(m):
     rid = getattr(rt, 'reply_to_msg_id', 0)
     # bare reply_to_msg_id==1 (or a service marker) means the General area
     return rid not in (0, 1)
+
+
+async def smart_download(client, msg, path):
+    """Parallel download for files >=5MB with byte-size verification;
+    standard download otherwise or on any problem."""
+    doc = getattr(msg, 'document', None)
+    size = (doc.size if doc else 0) or 0
+    if FT is not None and doc is not None and size >= 5 * 1024 * 1024:
+        t0 = time.time()
+        try:
+            with open(path, 'wb') as f:
+                await FT.download_file(client, doc, f)
+            got = os.path.getsize(path)
+            if got == size:
+                print(f'   [FAST-DL] {size/1024/1024:.1f}MB in {time.time()-t0:.0f}s')
+                return path
+            print(f'   [FAST-DL] SIZE MISMATCH ({got} != {size}) - standard retry')
+        except Exception as e:
+            print(f'   [FAST-DL fallback] {type(e).__name__}: {str(e)[:90]}')
+        # clean partial file before standard attempt
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return await client.download_media(msg, file=path)
+
+
+async def fast_upload_and_send(client, peer, path, src_msg, reply_to, caption):
+    """Parallel upload for documents/videos >=20MB. Preserves EXACT source
+    attributes/mime-type/thumbnail by handing the pre-uploaded InputFile to
+    send_file (which builds the message correctly). Raises if not applicable -
+    caller then uses the standard send path."""
+    doc = getattr(src_msg, 'document', None)
+    size = os.path.getsize(path)
+    if FT is None or not doc or size < 20 * 1024 * 1024:
+        raise RuntimeError('fast upload not applicable')
+    fn = next((getattr(a, 'file_name', '') for a in doc.attributes
+               if hasattr(a, 'file_name')), '') or 'file'
+    t0 = time.time()
+    with open(path, 'rb') as f:
+        input_file = await FT.upload_file(client, f, filename=fn)
+    thumb = None
+    try:  # original thumbnail -> identical preview in the new topic
+        if doc.thumbs:
+            tp = await client.download_media(src_msg, thumb=-1)
+            if tp:
+                thumb = await client.upload_file(tp)
+                os.remove(tp)
+    except Exception:
+        thumb = None
+    sent = await client.send_file(
+        peer, input_file,
+        caption=(caption or None), reply_to=reply_to,
+        attributes=list(doc.attributes), mime_type=doc.mime_type,
+        force_document=True, file_name=fn, thumb=thumb)
+    print(f'   [FAST-UP] {size/1024/1024:.1f}MB in {time.time()-t0:.0f}s')
+    return sent
 
 
 def is_video(doc):
@@ -132,14 +194,21 @@ async def process_message(client, new, m, new_tid, row):
             return 'skipped', None, meta  # over Telegram 2GB upload cap
         os.makedirs(DL_DIR, exist_ok=True)
         safe_fn = ''.join(c for c in (fn or f'file_{m.id}') if c not in '\\/:*?"<>|').strip() or f'file_{m.id}'
-        path = await client.download_media(m, file=os.path.join(DL_DIR, safe_fn))
+        final_path = os.path.join(DL_DIR, safe_fn)
+        path = await smart_download(client, m, final_path)
         if path:
             try:
                 vid = is_video(doc)
-                sent = await client.send_file(
-                    new, path, caption=(text or None),
-                    reply_to=new_tid,
-                    supports_streaming=vid, force_document=not vid)
+                try:
+                    sent = await fast_upload_and_send(
+                        client, new, path, m, new_tid, text)
+                except Exception as ue:
+                    if 'not applicable' not in str(ue):
+                        print(f'   [FAST-UP fallback] {type(ue).__name__}: {str(ue)[:90]}')
+                    sent = await client.send_file(
+                        new, path, caption=(text or None),
+                        reply_to=new_tid,
+                        supports_streaming=vid, force_document=not vid)
                 return 'done', sent.id, meta
             finally:
                 try:
