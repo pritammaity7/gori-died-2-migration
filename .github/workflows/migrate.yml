@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 59
     concurrency:
-      group: gori2-migration
+      group: gori2-${{ github.event.client_payload.shard || format('manual-{0}', github.run_id) }}
       cancel-in-progress: false
     steps:
       - name: Checkout
@@ -24,7 +24,7 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run migration chunk
+      - name: Run migration worker
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -34,4 +34,5 @@ jobs:
           WORKER_URL: ${{ secrets.WORKER_URL }}
           MIGRATE_KEY: ${{ secrets.MIGRATE_KEY }}
           TIME_BUDGET_MIN: '48'
+          SHARD: ${{ github.event.client_payload.shard || 'manual' }}
         run: python migrate.py
