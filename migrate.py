@@ -36,8 +36,10 @@ BUDGET_MIN = float(os.environ.get('TIME_BUDGET_MIN', '48'))
 WORKER_ID = 'shard-' + SHARD + '-' + str(os.getpid())
 DL_DIR = '/tmp/migdl'
 START = time.time()
-# A single message (download+upload of one file) must never hang the whole run.
-PER_MSG_TIMEOUT = float(os.environ.get('PER_MSG_TIMEOUT', '900'))  # 15 min
+# A single message must never hang the whole run: hard cap (minutes-scale) plus
+# an aggressive STALL detector (zero byte-growth) below.
+PER_MSG_TIMEOUT = float(os.environ.get('PER_MSG_TIMEOUT', '1800'))  # 30 min hard cap
+STALL_SECS = float(os.environ.get('STALL_SECS', '240'))             # no-progress limit
 
 try:
     import fast_telethon as FT          # vendored parallel-transfer module
@@ -83,29 +85,68 @@ def topic_is_forum_topic(m):
     return rid not in (0, 1)
 
 
+async def _run_monitored(label, coro, path):
+    """Drive a download coroutine while watching byte growth of `path`.
+    Zero new bytes for STALL_SECS -> cancel and raise RuntimeError so the
+    message is marked FAILED and retried next wave (never hangs the run).
+    Steady large transfers are unaffected regardless of duration."""
+    task = asyncio.create_task(coro)
+    last, last_chg = -1, time.time()
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=20)
+            if task in done:
+                return task.result()
+            try:
+                cur = os.path.getsize(path)
+            except OSError:
+                cur = 0
+            if cur != last:
+                last, last_chg = cur, time.time()
+            elif time.time() - last_chg > STALL_SECS:
+                task.cancel()
+                try:
+                    await task
+                except Exception:
+                    pass
+                raise RuntimeError(f'{label}: stalled {STALL_SECS:.0f}s '
+                                   f'(zero progress at {cur / 1048576:.0f}MB)')
+    except BaseException:
+        if not task.done():
+            task.cancel()
+        raise
+
+
 async def smart_download(client, msg, path):
-    """Parallel download for files >=5MB with byte-size verification;
-    standard download otherwise or on any problem."""
+    """Parallel download for files >=5MB with byte verification and a stall
+    watchdog; falls back to standard download once, then raises on repeat stall
+    so the caller records a failure (auto-retried next wave)."""
     doc = getattr(msg, 'document', None)
     size = (doc.size if doc else 0) or 0
     if FT is not None and doc is not None and size >= 5 * 1024 * 1024:
         t0 = time.time()
-        try:
+
+        async def run_fast():
             with open(path, 'wb') as f:
                 await FT.download_file(client, doc, f)
             got = os.path.getsize(path)
-            if got == size:
-                print(f'   [FAST-DL] {size/1024/1024:.1f}MB in {time.time()-t0:.0f}s')
-                return path
-            print(f'   [FAST-DL] SIZE MISMATCH ({got} != {size}) - standard retry')
+            if got != size:
+                raise RuntimeError(f'SIZE MISMATCH {got} != {size}')
+            return path
+
+        try:
+            p = await _run_monitored('FAST-DL', run_fast(), path)
+            print(f'   [FAST-DL] {size / 1024 / 1024:.1f}MB in {time.time() - t0:.0f}s')
+            return p
         except Exception as e:
             print(f'   [FAST-DL fallback] {type(e).__name__}: {str(e)[:90]}')
-        # clean partial file before standard attempt
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-    return await client.download_media(msg, file=path)
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    async def run_std():
+        return await client.download_media(msg, file=path)
+    return await _run_monitored('STD-DL', run_std(), path)
 
 
 class MsgBatch:
