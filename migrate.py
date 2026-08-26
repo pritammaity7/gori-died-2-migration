@@ -503,6 +503,25 @@ async def main():
                     await batch.maybe_flush(payload)
                 topics_done += 1
                 print(f'   [TOPIC COMPLETE] {count} msgs this run')
+                # AUTO TAIL-REPAIR: if any retriable failure sits BELOW the
+                # cursor, delete its post-hole copies from Telegram, rewind and
+                # let the next claim replay that stretch in perfect order.
+                # A file keeps retrying across waves until forwarded or until it
+                # has failed 3 times (then surfaced on the dashboard).
+                try:
+                    rep = api_post('/api/repairinfo', {'topic_root': root}).get('repair')
+                    if rep:
+                        ids = [i for i in (rep.get('delete_new_ids') or []) if i]
+                        done_del = 0
+                        for k in range(0, len(ids), 50):
+                            await client.delete_messages(new, ids[k:k + 50])
+                            done_del += min(50, len(ids) - k)
+                        r2 = api_post('/api/applyrepair', {'topic_root': root, 'hole': rep['hole']})
+                        print(f'   [REPAIR] hole at {rep["hole"]}: deleted {done_del} '
+                              f'post-hole copies -> replaying ascending '
+                              f'(apply={r2.get("ok")})')
+                except Exception as e:
+                    print(f'   [REPAIR] skipped ({type(e).__name__}: {str(e)[:90]})')
                 if is_general and last_seen > cursor:
                     # reached the true end of the group chat -> close out the row
                     await batch.flush()
