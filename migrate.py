@@ -439,6 +439,7 @@ async def main():
                       f"({stats['total_videos']} videos / {stats['total_docs']} files / {stats['total_photos']} photos)")
 
             count = 0
+            blocked = False
             last_hb = time.time()
             last_seen = cursor
             try:
@@ -458,41 +459,72 @@ async def main():
                         continue
                     if is_general and topic_is_forum_topic(m):
                         continue  # belongs to a real topic - handled by its own claim
-                    try:
-                        # watchdog: a single message must never hang the whole run
-                        status, new_mid, meta = await asyncio.wait_for(
-                            process_message(client, new, m, new_tid, t), timeout=PER_MSG_TIMEOUT)
-                    except asyncio.TimeoutError:
-                        sz = getattr(getattr(m, 'document', None), 'size', 0) or 0
-                        print(f'   [WATCHDOG] msg {m.id} exceeded {PER_MSG_TIMEOUT}s '
-                              f'({sz/1024/1024:.0f}MB) - marking failed, moving on')
-                        batch.add({'old_msg_id': m.id, 'cursor': m.id, 'status': 'failed',
-                                   'kind': 'unknown', 'file_name': 'watchdog-timeout',
-                                   'caption': (m.message or '')[:200]})
-                        await batch.maybe_flush()
-                        continue
-                    except errors.FloodWaitError as e:
-                        wait = min(e.seconds + 2, max(0, remaining() - 60))
-                        if wait <= 0:
-                            print('[TIME] floodwait beyond budget, exiting')
+                    # HEAD-OF-LINE BLOCKING (2026-08-29).
+                    # The destination only appends, so a message may NEVER be
+                    # copied while an earlier one is unresolved - otherwise the
+                    # topic ends up out of order and needs a tail repair.
+                    # Policy: retry the same message in-run with backoff; if it
+                    # still fails, STOP this topic and move to another one. The
+                    # cursor is never advanced past a failure.
+                    ATTEMPTS = 3
+                    status = new_mid = meta = None
+                    fail_item = None
+                    for attempt in range(1, ATTEMPTS + 1):
+                        if remaining() < 180:
+                            print('[TIME] not enough budget for another attempt')
                             await batch.flush()
                             return
-                        print(f'   [FLOODWAIT] {e.seconds}s')
-                        await asyncio.sleep(wait)
-                        continue
-                    except Exception as e:
-                        print(f'   [ERR] msg {m.id}: {type(e).__name__}: {str(e)[:120]}')
-                        item = {'old_msg_id': m.id, 'cursor': m.id, 'status': 'failed',
-                                'kind': 'unknown', 'file_name': '',
-                                'caption': (m.message or '')[:200]}
-                        if m.document:
-                            item['kind'] = 'document'
-                            item['file_name'] = next((getattr(a, 'file_name', '') for a in m.document.attributes
-                                                      if hasattr(a, 'file_name')), '')
-                            item['size'] = m.document.size or 0
-                        batch.add(item)
-                        await batch.maybe_flush(item)
-                        continue
+                        try:
+                            status, new_mid, meta = await asyncio.wait_for(
+                                process_message(client, new, m, new_tid, t),
+                                timeout=PER_MSG_TIMEOUT)
+                            fail_item = None
+                            break
+                        except asyncio.TimeoutError:
+                            sz = getattr(getattr(m, 'document', None), 'size', 0) or 0
+                            print(f'   [WATCHDOG] msg {m.id} attempt {attempt}/{ATTEMPTS} '
+                                  f'exceeded {PER_MSG_TIMEOUT}s ({sz / 1048576:.0f}MB)')
+                            fail_item = {'old_msg_id': m.id, 'cursor': cursor,
+                                         'status': 'failed', 'kind': 'unknown',
+                                         'file_name': 'watchdog-timeout',
+                                         'caption': (m.message or '')[:200]}
+                        except errors.FloodWaitError as e:
+                            wait = min(e.seconds + 2, max(0, remaining() - 60))
+                            if wait <= 0:
+                                print('[TIME] floodwait beyond budget, exiting')
+                                await batch.flush()
+                                return
+                            print(f'   [FLOODWAIT] {e.seconds}s')
+                            await asyncio.sleep(wait)
+                            continue           # floodwait is not a failure
+                        except Exception as e:
+                            print(f'   [ERR] msg {m.id} attempt {attempt}/{ATTEMPTS}: '
+                                  f'{type(e).__name__}: {str(e)[:110]}')
+                            fail_item = {'old_msg_id': m.id, 'cursor': cursor,
+                                         'status': 'failed', 'kind': 'unknown',
+                                         'file_name': '',
+                                         'caption': (m.message or '')[:200]}
+                            if m.document:
+                                fail_item['kind'] = 'document'
+                                fail_item['file_name'] = next(
+                                    (getattr(a, 'file_name', '') for a in m.document.attributes
+                                     if hasattr(a, 'file_name')), '')
+                                fail_item['size'] = m.document.size or 0
+                        if attempt < ATTEMPTS:
+                            back = 15 * attempt
+                            print(f'   [RETRY] msg {m.id} again in {back}s')
+                            await asyncio.sleep(back)
+
+                    if fail_item is not None:
+                        # record the failure WITHOUT advancing the cursor, then
+                        # abandon this topic so nothing is appended after the hole
+                        batch.add(fail_item)
+                        await batch.flush()
+                        print(f'   [BLOCKED] msg {m.id} failed {ATTEMPTS}x - stopping this '
+                              f'topic to preserve order; another topic will be claimed')
+                        api_post('/api/release', {'topic_root': root, 'worker_id': WORKER_ID})
+                        blocked = True
+                        break
 
                     payload = {'old_msg_id': m.id, 'cursor': m.id, 'status': status,
                                'new_msg_id': new_mid, **meta}
@@ -501,6 +533,9 @@ async def main():
                     if count % 25 == 0:
                         print(f'   ... {count} msgs (at id {m.id}, {remaining():.0f}s left)')
                     await batch.maybe_flush(payload)
+                if blocked:
+                    await batch.flush()
+                    continue
                 topics_done += 1
                 print(f'   [TOPIC COMPLETE] {count} msgs this run')
                 # AUTO TAIL-REPAIR: if any retriable failure sits BELOW the
