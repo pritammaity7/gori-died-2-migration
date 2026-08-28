@@ -442,6 +442,35 @@ async def main():
             blocked = False
             last_hb = time.time()
             last_seen = cursor
+            # CONTIGUITY GUARD (2026-08-29): before appending anything, prove the
+            # ledger has no gap below the cursor. Telegram only appends, so
+            # copying while an earlier message is missing permanently breaks the
+            # lesson order. If a gap exists we refuse the topic and report it
+            # rather than making the damage worse.
+            gap_found = None
+            try:
+                probe_ids = []
+                async for pm in client.iter_messages(
+                        old, reply_to=None if is_general else root,
+                        reverse=True, max_id=cursor + 1):
+                    if pm.id > cursor:
+                        break
+                    if pm.action and not pm.media:
+                        continue
+                    probe_ids.append(pm.id)
+                    if pm.id not in done_ids and pm.id not in failed_ids:
+                        gap_found = pm.id
+                        break
+            except Exception as e:
+                print(f'   [GUARD] contiguity probe skipped: {type(e).__name__}')
+            if gap_found is not None:
+                print(f'   [GUARD] ledger gap at old_msg {gap_found} (cursor={cursor}) - '
+                      f'refusing to append; reporting for repair')
+                api_post('/api/update', {'topic_root': root, 'cursor': cursor,
+                                         'gap_at': gap_found})
+                api_post('/api/release', {'topic_root': root, 'worker_id': WORKER_ID})
+                continue
+
             try:
                 it = client.iter_messages(old, reply_to=None if is_general else root,
                                           reverse=True, min_id=cursor)
