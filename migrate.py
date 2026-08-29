@@ -118,11 +118,27 @@ async def _run_monitored(label, coro, path):
 
 
 async def smart_download(client, msg, path):
-    """Parallel download for files >=5MB with byte verification and a stall
-    watchdog; falls back to standard download once, then raises on repeat stall
-    so the caller records a failure (auto-retried next wave)."""
+    """Download with three escalating strategies.
+
+    Root cause of the repeated failures (from the Action logs, 2026-08-29):
+        Telegram is having internal issues TimeoutError: Timeout while fetching
+        data (caused by GetFileRequest)   ->  ValueError: Request was unsuccessful
+        6 time(s)
+    Telethon retries a GetFileRequest `request_retries` times (default 5, hence
+    "6 time(s)") and then gives up. Per Telethon's docs those retries fire on
+    ServerError / RpcCallFail / migrate errors - i.e. a *transient* DC problem.
+    The file is fine; the DC route is briefly unhealthy.
+
+    So instead of failing the message we escalate:
+      1. FastTelethon parallel download (many senders, fastest)
+      2. standard download with a smaller chunk size (gentler on a sick DC)
+      3. standard download after a cooldown, giving the DC time to recover
+    Only if all three fail does the caller record a failure - and even then the
+    message is never skipped, it just blocks its own topic until it succeeds.
+    """
     doc = getattr(msg, 'document', None)
     size = (doc.size if doc else 0) or 0
+
     if FT is not None and doc is not None and size >= 5 * 1024 * 1024:
         t0 = time.time()
 
@@ -144,9 +160,27 @@ async def smart_download(client, msg, path):
                 os.remove(path)
             except OSError:
                 pass
-    async def run_std():
-        return await client.download_media(msg, file=path)
-    return await _run_monitored('STD-DL', run_std(), path)
+
+    # 256 KB parts: legal per MTProto (1048576 % 262144 == 0) and far more
+    # tolerant of a DC that is timing out on 1 MB reads.
+    for attempt, (part, cooldown) in enumerate(((256 * 1024, 0), (128 * 1024, 45)), 1):
+        if cooldown:
+            print(f'   [DL COOLDOWN] waiting {cooldown}s for the DC to recover')
+            await asyncio.sleep(cooldown)
+
+        async def run_std():
+            return await client.download_media(msg, file=path, part_size_kb=part // 1024)
+
+        try:
+            return await _run_monitored(f'STD-DL/{part // 1024}k', run_std(), path)
+        except Exception as e:
+            print(f'   [STD-DL attempt {attempt}] {type(e).__name__}: {str(e)[:90]}')
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            if attempt == 2:
+                raise
 
 
 class MsgBatch:
@@ -385,7 +419,17 @@ async def count_totals_full(client, old, root):
 
 
 async def main():
-    client = TelegramClient(StringSessionHolder(), API_ID, API_HASH)
+    client = TelegramClient(StringSessionHolder(), API_ID, API_HASH,
+                            # Transient DC timeouts were the top cause of failed
+                            # messages: Telethon gave up after 6 tries and raised
+                            # ValueError. More retries + a longer per-request
+                            # timeout let these files through instead.
+                            request_retries=12,
+                            connection_retries=None,
+                            retry_delay=5,
+                            timeout=90,
+                            flood_sleep_threshold=120,
+                            auto_reconnect=True)
     await client.connect()
     if not await client.is_user_authorized():
         print('[FATAL] session invalid')
@@ -415,8 +459,23 @@ async def main():
         root = t['old_root']
         cursor = t.get('cursor') or 0
         done_ids = set(c.get('done_ids') or [])
-        failed_ids = set(c.get('failed_ids') or [])
+        failed_ids = set(c.get('failed_ids') or [])   # always empty now, see /api/claim
+        retry_from = c.get('retry_from')
+        retry_tries = c.get('retry_tries') or 0
         is_general = (root == -1)   # special row: whole-group chat outside topics
+        # An unresolved failure means this topic is BLOCKED at that message. We
+        # must resume exactly there - never past it - because the destination
+        # only appends. If it has already burned many attempts, leave the topic
+        # to another wave so the fleet keeps making progress elsewhere.
+        if retry_from is not None:
+            if retry_tries >= 12:
+                print(f"[SKIP TOPIC] {t['title']!r} blocked at old_msg {retry_from} "
+                      f"after {retry_tries} attempts - needs attention, releasing")
+                api_post('/api/release', {'topic_root': root, 'worker_id': WORKER_ID})
+                continue
+            cursor = min(cursor, retry_from - 1)
+            print(f'   [RESUME] unresolved failure at {retry_from} '
+                  f'({retry_tries} prior attempts) - restarting from {cursor + 1}')
         print(f"\n=== CLAIMED {t['title']!r} (root={root}, cursor={cursor}, "
               f"done_ids={len(done_ids)}, failed_skip={len(failed_ids)}) ===")
 
