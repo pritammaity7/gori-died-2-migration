@@ -61,6 +61,16 @@ except Exception:
 
 HDRS = {'x-migrate-key': KEY, 'content-type': 'application/json'}
 
+# Hard client-side budget. On 2026-08-29 a spin loop spent 136,898 Worker
+# requests and 5.1 BILLION D1 rows read in a single day (limits: 100k requests,
+# 5M rows). A worker must never be *able* to do that again, whatever the bug.
+CALL_BUDGET = int(os.environ.get('CALL_BUDGET', '2000'))
+_calls = {'n': 0}
+
+
+def budget_left():
+    return CALL_BUDGET - _calls['n']
+
 
 def api_get(path, tries=6):
     """GET with backoff and failover.
@@ -77,6 +87,9 @@ def api_get(path, tries=6):
             if r.status_code == 200:
                 return r.json()
             print(f'   [GET {path}] HTTP {r.status_code} (attempt {attempt + 1}/{tries})')
+            if r.status_code == 429:
+                # account-level quota: backing off harder is the only sane move
+                time.sleep(30)
         except Exception as e:
             print(f'   [GET {path}] {type(e).__name__} (attempt {attempt + 1}/{tries})')
         time.sleep(min(60, 4 * (attempt + 1) ** 2))
@@ -85,6 +98,10 @@ def api_get(path, tries=6):
 
 
 def api_post(path, payload, tries=6):
+    if _calls['n'] >= CALL_BUDGET:
+        print(f'   [BUDGET] {CALL_BUDGET} panel calls used - refusing further calls')
+        return {}
+    _calls['n'] += 1
     hosts = [WORKER] + [h for h in (WORKER_ALT,) if h and h != WORKER]
     for attempt in range(tries):
         host = hosts[attempt % len(hosts)]
@@ -509,8 +526,8 @@ async def main():
         idle_rounds = 0
         root = t['old_root']
         cursor = t.get('cursor') or 0
-        done_ids = set(c.get('done_ids') or [])
-        failed_ids = set(c.get('failed_ids') or [])   # always empty now, see /api/claim
+        done_ids = set()          # panel no longer ships id sets; cursor is truth
+        failed_ids = set()
         retry_from = c.get('retry_from')
         retry_tries = c.get('retry_tries') or 0
         is_general = (root == -1)   # special row: whole-group chat outside topics
@@ -557,7 +574,7 @@ async def main():
             print(f'   [RESUME] unresolved failure at {retry_from} '
                   f'({retry_tries} prior attempts) - restarting from {cursor + 1}')
         print(f"\n=== CLAIMED {t['title']!r} (root={root}, cursor={cursor}, "
-              f"done_ids={len(done_ids)}, failed_skip={len(failed_ids)}) ===")
+              f"calls_used={_calls['n']}/{CALL_BUDGET}) ===")
 
         try:
             new_tid = await ensure_new_topic(client, new, t)
@@ -586,20 +603,14 @@ async def main():
             # copying while an earlier message is missing permanently breaks the
             # lesson order. If a gap exists we refuse the topic and report it
             # rather than making the damage worse.
+            #
+            # The guard now asks the panel for a single aggregate instead of
+            # pulling every done_id: returning the whole ledger per claim is what
+            # produced 5.1 billion D1 rows read in a day.
             gap_found = None
             try:
-                probe_ids = []
-                async for pm in client.iter_messages(
-                        old, reply_to=None if is_general else root,
-                        reverse=True, max_id=cursor + 1):
-                    if pm.id > cursor:
-                        break
-                    if pm.action and not pm.media:
-                        continue
-                    probe_ids.append(pm.id)
-                    if pm.id not in done_ids and pm.id not in failed_ids:
-                        gap_found = pm.id
-                        break
+                g = api_post('/api/gapcheck', {'topic_root': root, 'cursor': cursor}) or {}
+                gap_found = g.get('gap_at')
             except Exception as e:
                 print(f'   [GUARD] contiguity probe skipped: {type(e).__name__}')
             if gap_found is not None:
@@ -623,7 +634,10 @@ async def main():
                         await batch.flush()          # keep cursor durable before idle heartbeat
                         api_post('/api/heartbeat', {'topic_root': root, 'worker_id': WORKER_ID})
                         last_hb = time.time()
-                    if m.id <= cursor or m.id in done_ids or m.id in failed_ids:
+                    # cursor alone decides what has been processed: the panel no
+                    # longer ships per-message id sets (that cost 5.1B rows read
+                    # in a day). Anything at or below the cursor is done.
+                    if m.id <= cursor:
                         continue
                     if is_general and topic_is_forum_topic(m):
                         continue  # belongs to a real topic - handled by its own claim
