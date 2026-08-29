@@ -31,6 +31,10 @@ SESSION = _pick_session()
 OLD_ID = int(os.environ['OLD_CHAT_ID'])
 NEW_ID = int(os.environ['NEW_CHAT_ID'])
 WORKER = os.environ['WORKER_URL'].rstrip('/')
+# Failover host: if the primary panel is edge-rate-limited, the identical v2
+# worker serves the same D1 database.
+WORKER_ALT = os.environ.get('WORKER_URL_ALT', '').rstrip('/') or \
+    WORKER.replace('gori-died-2-panel.', 'gori-died-2-panel-v2.')
 KEY = os.environ['MIGRATE_KEY']
 BUDGET_MIN = float(os.environ.get('TIME_BUDGET_MIN', '48'))
 WORKER_ID = 'shard-' + SHARD + '-' + str(os.getpid())
@@ -40,6 +44,15 @@ START = time.time()
 # an aggressive STALL detector (zero byte-growth) below.
 PER_MSG_TIMEOUT = float(os.environ.get('PER_MSG_TIMEOUT', '1800'))  # 30 min hard cap
 STALL_SECS = float(os.environ.get('STALL_SECS', '240'))             # no-progress limit
+# Attempts (across waves) before a topic is quarantined instead of retried.
+RETRY_CEILING = int(os.environ.get('RETRY_CEILING', '12'))
+# Attempts before a message is declared DEAD - i.e. Telegram itself will not
+# serve the bytes to anyone. Proven on 2026-08-29: one PDF failed from all five
+# user identities with fresh file_references, and sendMedia re-send is blocked by
+# the source group's forward restriction, so no legal path exists. A dead message
+# gets a placeholder in its exact position, which keeps the sequence intact and
+# means we never have to delete-and-replay a topic again.
+DEAD_AFTER = int(os.environ.get('DEAD_AFTER', '24'))
 
 try:
     import fast_telethon as FT          # vendored parallel-transfer module
@@ -49,22 +62,41 @@ except Exception:
 HDRS = {'x-migrate-key': KEY, 'content-type': 'application/json'}
 
 
-def api_get(path):
-    r = requests.get(WORKER + path, headers=HDRS, timeout=30)
-    r.raise_for_status()
-    return r.json()
+def api_get(path, tries=6):
+    """GET with backoff and failover.
 
-
-def api_post(path, payload):
-    for attempt in range(4):
+    A single transient 429 from Cloudflare's edge used to kill an entire run
+    (exit code 1) because this had no retry at all - that was the cause of five
+    dead waves on 2026-08-29. Never raise on a transient; the caller decides.
+    """
+    hosts = [WORKER] + [h for h in (WORKER_ALT,) if h and h != WORKER]
+    for attempt in range(tries):
+        host = hosts[attempt % len(hosts)]
         try:
-            r = requests.post(WORKER + path, headers=HDRS, data=json.dumps(payload), timeout=30)
+            r = requests.get(host + path, headers=HDRS, timeout=30)
             if r.status_code == 200:
                 return r.json()
+            print(f'   [GET {path}] HTTP {r.status_code} (attempt {attempt + 1}/{tries})')
         except Exception as e:
-            print(f'   worker post retry {attempt}: {e}')
-        time.sleep(3 * (attempt + 1))
-    print('   [WARN] worker unreachable, continuing (state may replay)')
+            print(f'   [GET {path}] {type(e).__name__} (attempt {attempt + 1}/{tries})')
+        time.sleep(min(60, 4 * (attempt + 1) ** 2))
+    print(f'   [WARN] {path} unreachable after {tries} tries')
+    return {}
+
+
+def api_post(path, payload, tries=6):
+    hosts = [WORKER] + [h for h in (WORKER_ALT,) if h and h != WORKER]
+    for attempt in range(tries):
+        host = hosts[attempt % len(hosts)]
+        try:
+            r = requests.post(host + path, headers=HDRS, data=json.dumps(payload), timeout=30)
+            if r.status_code == 200:
+                return r.json()
+            print(f'   [POST {path}] HTTP {r.status_code} (attempt {attempt + 1}/{tries})')
+        except Exception as e:
+            print(f'   [POST {path}] {type(e).__name__} (attempt {attempt + 1}/{tries})')
+        time.sleep(min(60, 4 * (attempt + 1) ** 2))
+    print(f'   [WARN] {path} unreachable, continuing (state may replay)')
     return {}
 
 
@@ -419,6 +451,17 @@ async def count_totals_full(client, old, root):
 
 
 async def main():
+    # Stagger starts: five shards launching within a couple of seconds hammered
+    # the panel hard enough to trip Cloudflare's edge limiter. Shard index gives
+    # each worker its own slot.
+    try:
+        slot = int(SHARD) * 8
+    except ValueError:
+        slot = 0
+    if slot:
+        print(f'[STAGGER] shard {SHARD}: waiting {slot}s before startup')
+        await asyncio.sleep(slot)
+
     client = TelegramClient(StringSessionHolder(), API_ID, API_HASH,
                             # Transient DC timeouts were the top cause of failed
                             # messages: Telethon gave up after 6 tries and raised
@@ -443,19 +486,27 @@ async def main():
     new = await client.get_entity(NEW_ID)
     print(f'[OK] {me.first_name} | worker={WORKER_ID} | budget {BUDGET_MIN} min')
 
-    st = api_get('/api/state')
     # ALWAYS re-seed: refreshes top_msg for known topics (catches new messages
     # appended to old topics) and discovers newly-closed topics (patrol mode).
+    # NOTE: /api/state used to be called twice here and its result thrown away -
+    # ten of the heaviest requests per wave for nothing. Removed.
     await seed_topics(client, old)
-    st = api_get('/api/state')
 
     topics_done = 0
+    idle_rounds = 0
     while remaining() > 300:
         c = api_post('/api/claim', {'worker_id': WORKER_ID})
         t = c.get('topic')
         if not t:
-            print('[CLAIM] nothing left to migrate - all caught up')
-            break
+            print('[CLAIM] nothing claimable right now (all done or quarantined)')
+            idle_rounds += 1
+            if idle_rounds >= 3 or remaining() < 600:
+                break
+            # never spin: a claim loop with no cooldown is what tripped the edge
+            # limiter. Wait before asking again.
+            await asyncio.sleep(60)
+            continue
+        idle_rounds = 0
         root = t['old_root']
         cursor = t.get('cursor') or 0
         done_ids = set(c.get('done_ids') or [])
@@ -465,13 +516,42 @@ async def main():
         is_general = (root == -1)   # special row: whole-group chat outside topics
         # An unresolved failure means this topic is BLOCKED at that message. We
         # must resume exactly there - never past it - because the destination
-        # only appends. If it has already burned many attempts, leave the topic
-        # to another wave so the fleet keeps making progress elsewhere.
+        # only appends.
         if retry_from is not None:
-            if retry_tries >= 12:
-                print(f"[SKIP TOPIC] {t['title']!r} blocked at old_msg {retry_from} "
-                      f"after {retry_tries} attempts - needs attention, releasing")
-                api_post('/api/release', {'topic_root': root, 'worker_id': WORKER_ID})
+            if retry_tries >= DEAD_AFTER:
+                # Every retry path has been exhausted many times over. Post a
+                # placeholder IN POSITION so the sequence keeps its slot, record
+                # the message as dead, and let the topic continue. No deletion,
+                # no replay - the position is occupied, so there is no hole.
+                info = api_post('/api/deadinfo', {'topic_root': root,
+                                                  'old_msg_id': retry_from}) or {}
+                name = info.get('file_name') or ''
+                try:
+                    ph = await client.send_message(
+                        new, f'⚠️ Missing file: {name or f"message {retry_from}"}\n'
+                             f'Telegram no longer serves this file from the source '
+                             f'channel, so it could not be copied. Everything before '
+                             f'and after it is complete and in order.',
+                        reply_to=await ensure_new_topic(client, new, t))
+                    api_post('/api/dead', {
+                        'topic_root': root, 'old_msg_id': retry_from,
+                        'new_msg_id': ph.id, 'file_name': name,
+                        'size': info.get('size') or 0, 'kind': info.get('kind') or 'unknown',
+                        'reason': 'unreadable at source after %d attempts' % retry_tries})
+                    print(f'   [DEAD] old_msg {retry_from} marked dead; placeholder '
+                          f'{ph.id} posted in position')
+                    continue
+                except Exception as e:
+                    print(f'   [DEAD] placeholder failed: {type(e).__name__}: {str(e)[:80]}')
+                    api_post('/api/quarantine', {'topic_root': root})
+                    continue
+            if retry_tries >= RETRY_CEILING:
+                # Not yet provably dead: quarantine with exponential cooldown so
+                # the fleet works elsewhere and the panel is never hammered.
+                print(f"[QUARANTINE] {t['title']!r} stuck at old_msg {retry_from} "
+                      f"after {retry_tries} attempts")
+                q = api_post('/api/quarantine', {'topic_root': root})
+                print(f"   cooldown {q.get('cooldown_secs', '?')}s")
                 continue
             cursor = min(cursor, retry_from - 1)
             print(f'   [RESUME] unresolved failure at {retry_from} '
