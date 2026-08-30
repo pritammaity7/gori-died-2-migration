@@ -8,9 +8,124 @@ Env: TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION (StringSession),
      OLD_CHAT_ID, NEW_CHAT_ID, WORKER_URL, MIGRATE_KEY, TIME_BUDGET_MIN
 """
 import asyncio, os, sys, time, json
+import logging
+from collections import deque
 import requests
 from telethon import TelegramClient, errors
 from telethon.tl.functions.messages import GetForumTopicsRequest, CreateForumTopicRequest
+
+# ===========================================================================
+# DIAGNOSTICS (2026-08-30)
+#
+# Why this exists. Every failure of the stuck files looked like this in the log:
+#
+#     [FAST-DL fallback] ValueError: Request was unsuccessful 13 time(s)
+#     [STD-DL attempt 1] ValueError: Request was unsuccessful 13 time(s)
+#     [ERR] msg 12161 attempt 1/3: ValueError: Request was unsuccessful 13 time(s)
+#
+# That message is Telethon giving up after `request_retries`. It tells us NOTHING
+# about the actual cause, because Telethon logs the real RPC error to its own
+# logger and then raises this generic ValueError. Without the telethon logger
+# attached we could not tell apart:
+#
+#   * a sick DC route            (transient - retry later, different account)
+#   * FILE_REFERENCE_EXPIRED     (our fault - re-fetch the message)
+#   * FILE_ID_INVALID / no bytes (genuinely dead at source)
+#   * a 0-byte stall / timeout   (network, not Telegram)
+#
+# So: capture the telethon logger into a ring buffer, and on every failure emit
+# ONE greppable JSON line with the full identity of the document, what we had
+# actually received, and the telethon tail that preceded the give-up. Everything
+# is also mirrored into the job summary + an artifact so the pattern is visible
+# from the Actions page without downloading a log zip.
+# ===========================================================================
+
+DIAG_ON = os.environ.get('DIAG', '1') not in ('0', 'false', '')
+TELETHON_LOG = os.environ.get('TELETHON_LOG', 'INFO').upper()
+DIAG_FILE = os.environ.get('DIAG_FILE', '/tmp/migrate_diag.jsonl')
+
+# Last N telethon log records, newest last. Telethon logs the true RPC error
+# ("Telegram is having internal issues", "RpcError 400: FILE_REFERENCE_EXPIRED",
+# DC migrations, timeouts) right before it raises the generic ValueError.
+_tl_ring = deque(maxlen=60)
+
+
+class _RingHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            _tl_ring.append(f'{record.levelname[:1]}:{record.name.split(".")[-1]}:'
+                            f'{record.getMessage()[:200]}')
+        except Exception:
+            pass
+
+
+if DIAG_ON:
+    logging.basicConfig(level=logging.WARNING,
+                        format='%(asctime)s %(levelname)s %(name)s %(message)s')
+    _tl = logging.getLogger('telethon')
+    _tl.setLevel(getattr(logging, TELETHON_LOG, logging.INFO))
+    _tl.addHandler(_RingHandler())
+    # keep telethon's own chatter off stdout; the ring buffer is the record
+    _tl.propagate = False
+
+
+def _tl_tail(n=12):
+    """The telethon records that immediately preceded a failure."""
+    return list(_tl_ring)[-n:]
+
+
+def diag(event, **fields):
+    """One greppable JSON line per interesting event.
+
+    Format: `[DIAG] {"ev": "...", ...}` — grep the Actions log for `[DIAG]` and
+    pipe through `jq` to get a table. Also appended to DIAG_FILE, which the
+    workflow uploads as an artifact.
+    """
+    if not DIAG_ON:
+        return
+    rec = {'ev': event, 't': round(time.time() - START, 1), 'shard': SHARD, **fields}
+    line = json.dumps(rec, ensure_ascii=False, default=str)
+    print(f'[DIAG] {line}', flush=True)
+    try:
+        with open(DIAG_FILE, 'a', encoding='utf-8') as f:
+            f.write(line + '\n')
+    except OSError:
+        pass
+
+
+def doc_identity(msg):
+    """Everything that distinguishes THIS handle to the file.
+
+    `access_hash` is per-account and `file_reference` expires within hours, so a
+    failure is only interpretable alongside these. Logged truncated — they are
+    capability tokens, not secrets, but there is no reason to print them whole.
+    """
+    d = getattr(msg, 'document', None) or getattr(msg, 'photo', None)
+    if d is None:
+        return {'media': type(getattr(msg, 'media', None)).__name__}
+    ref = getattr(d, 'file_reference', b'') or b''
+    return {
+        'doc_id': getattr(d, 'id', None),
+        'dc': getattr(d, 'dc_id', None),
+        'size': getattr(d, 'size', 0) or 0,
+        'ah_tail': str(getattr(d, 'access_hash', ''))[-6:],
+        'ref_len': len(ref),
+        'ref_head': ref[:4].hex(),
+        'mime': getattr(d, 'mime_type', ''),
+    }
+
+
+def _summary(md):
+    """Append to the GitHub Actions job summary (visible on the run page)."""
+    p = os.environ.get('GITHUB_STEP_SUMMARY')
+    if not p:
+        return
+    try:
+        with open(p, 'a', encoding='utf-8') as f:
+            f.write(md + '\n')
+    except OSError:
+        pass
+
 
 API_ID = int(os.environ['TELEGRAM_API_ID'])
 API_HASH = os.environ['TELEGRAM_API_HASH']
@@ -165,9 +280,17 @@ async def _run_monitored(label, coro, path):
     """Drive a download coroutine while watching byte growth of `path`.
     Zero new bytes for STALL_SECS -> cancel and raise RuntimeError so the
     message is marked FAILED and retried next wave (never hangs the run).
-    Steady large transfers are unaffected regardless of duration."""
+    Steady large transfers are unaffected regardless of duration.
+
+    Also records the byte-growth curve, which is the only way to tell a file that
+    never started (0 bytes -> Telegram refused) from one that died mid-transfer
+    (progress then stall -> DC/network). That distinction was invisible before:
+    both surfaced as the same generic ValueError.
+    """
     task = asyncio.create_task(coro)
     last, last_chg = -1, time.time()
+    peak = 0
+    ticks = 0
     try:
         while True:
             done, _ = await asyncio.wait({task}, timeout=20)
@@ -177,6 +300,8 @@ async def _run_monitored(label, coro, path):
                 cur = os.path.getsize(path)
             except OSError:
                 cur = 0
+            peak = max(peak, cur)
+            ticks += 1
             if cur != last:
                 last, last_chg = cur, time.time()
             elif time.time() - last_chg > STALL_SECS:
@@ -185,12 +310,21 @@ async def _run_monitored(label, coro, path):
                     await task
                 except Exception:
                     pass
+                diag('stall', label=label, peak_mb=round(peak / 1048576, 2),
+                     ticks=ticks, stall_secs=STALL_SECS, tl=_tl_tail())
                 raise RuntimeError(f'{label}: stalled {STALL_SECS:.0f}s '
                                    f'(zero progress at {cur / 1048576:.0f}MB)')
     except BaseException:
         if not task.done():
             task.cancel()
         raise
+    finally:
+        # `peak` is what makes a failure readable: 0 means Telegram never sent a
+        # byte, >0 means the transfer started and then broke.
+        _run_monitored.last_peak = peak
+
+
+_run_monitored.last_peak = 0
 
 
 async def smart_download(client, msg, path):
@@ -214,6 +348,7 @@ async def smart_download(client, msg, path):
     """
     doc = getattr(msg, 'document', None)
     size = (doc.size if doc else 0) or 0
+    ident = doc_identity(msg)
 
     if FT is not None and doc is not None and size >= 5 * 1024 * 1024:
         t0 = time.time()
@@ -232,6 +367,10 @@ async def smart_download(client, msg, path):
             return p
         except Exception as e:
             print(f'   [FAST-DL fallback] {type(e).__name__}: {str(e)[:90]}')
+            diag('dl_fail', stage='FAST-DL', msg_id=msg.id,
+                 err=type(e).__name__, detail=str(e)[:200],
+                 peak_mb=round(_run_monitored.last_peak / 1048576, 2),
+                 secs=round(time.time() - t0, 1), **ident, tl=_tl_tail())
             try:
                 os.remove(path)
             except OSError:
@@ -262,16 +401,70 @@ async def smart_download(client, msg, path):
                     raise RuntimeError(f'SIZE MISMATCH {got} != {size}')
             return path
 
+        t1 = time.time()
         try:
             return await _run_monitored(f'STD-DL/{part // 1024}k', run_std(), path)
         except Exception as e:
             print(f'   [STD-DL attempt {attempt}] {type(e).__name__}: {str(e)[:90]}')
+            diag('dl_fail', stage=f'STD-DL/{part // 1024}k', msg_id=msg.id,
+                 attempt=attempt, err=type(e).__name__, detail=str(e)[:200],
+                 peak_mb=round(_run_monitored.last_peak / 1048576, 2),
+                 secs=round(time.time() - t1, 1), **ident, tl=_tl_tail())
             try:
                 os.remove(path)
             except OSError:
                 pass
             if attempt == 2:
-                raise
+                # FRESH-REFERENCE LAST RESORT.
+                #
+                # `file_reference` expires within hours and `access_hash` is
+                # per-account. A message object that has been sitting in an
+                # iterator for most of a 48-minute run can therefore hold a
+                # handle Telegram no longer honours - and Telethon reports that
+                # as the same opaque "Request was unsuccessful N time(s)" as a
+                # sick DC. Re-fetching the message costs one API call and either
+                # succeeds (it was a stale handle) or proves the file is dead.
+                # Either way the log now says WHICH.
+                try:
+                    fresh = (await client.get_messages(msg.peer_id, ids=[msg.id]))[0]
+                except Exception as fe:
+                    diag('refetch_fail', msg_id=msg.id, err=type(fe).__name__,
+                         detail=str(fe)[:200], tl=_tl_tail())
+                    raise e
+                if fresh is None or not fresh.media:
+                    diag('refetch_gone', msg_id=msg.id,
+                         note='message or media no longer visible at source')
+                    raise e
+                new_ident = doc_identity(fresh)
+                diag('refetch', msg_id=msg.id, old=ident, new=new_ident,
+                     ref_changed=new_ident.get('ref_head') != ident.get('ref_head'))
+
+                async def run_fresh():
+                    with open(path, 'wb') as f:
+                        async for chunk in client.iter_download(fresh,
+                                                                request_size=256 * 1024):
+                            f.write(chunk)
+                    return path
+
+                t2 = time.time()
+                try:
+                    p = await _run_monitored('FRESH-DL', run_fresh(), path)
+                    diag('refetch_ok', msg_id=msg.id,
+                         secs=round(time.time() - t2, 1),
+                         note='STALE FILE REFERENCE was the cause, not a dead file')
+                    return p
+                except Exception as e2:
+                    diag('dl_fail', stage='FRESH-DL', msg_id=msg.id,
+                         err=type(e2).__name__, detail=str(e2)[:200],
+                         peak_mb=round(_run_monitored.last_peak / 1048576, 2),
+                         secs=round(time.time() - t2, 1), **new_ident,
+                         tl=_tl_tail(),
+                         note='failed even with a FRESH reference -> source-side')
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                    raise
 
 
 class MsgBatch:
@@ -615,6 +808,9 @@ async def main():
             cursor = min(cursor, retry_from - 1)
             print(f'   [RESUME] unresolved failure at {retry_from} '
                   f'({retry_tries} prior attempts) - restarting from {cursor + 1}')
+            diag('resume_blocked', topic=root, title=t.get('title'),
+                 retry_from=retry_from, prior_tries=retry_tries,
+                 ceiling=RETRY_CEILING, dead_after=DEAD_AFTER)
         print(f"\n=== CLAIMED {t['title']!r} (root={root}, cursor={cursor}, "
               f"calls_used={_calls['n']}/{CALL_BUDGET}) ===")
 
@@ -734,6 +930,20 @@ async def main():
                                     (getattr(a, 'file_name', '') for a in m.document.attributes
                                      if hasattr(a, 'file_name')), '')
                                 fail_item['size'] = m.document.size or 0
+                            # The structured record: this is what makes the
+                            # pattern findable across runs. `[ERR]` alone only
+                            # ever said "Request was unsuccessful N time(s)",
+                            # which is Telethon's give-up message and names no
+                            # cause. Here we attach the document identity, how
+                            # far the transfer got, and the telethon records that
+                            # preceded it.
+                            diag('msg_fail', msg_id=m.id, topic=root,
+                                 title=t.get('title'), attempt=attempt,
+                                 of=ATTEMPTS, err=type(e).__name__,
+                                 detail=str(e)[:300],
+                                 file_name=fail_item.get('file_name'),
+                                 size=fail_item.get('size', 0),
+                                 **doc_identity(m), tl=_tl_tail())
                         if attempt < ATTEMPTS:
                             back = 15 * attempt
                             print(f'   [RETRY] msg {m.id} again in {back}s')
@@ -746,6 +956,13 @@ async def main():
                         await batch.flush()
                         print(f'   [BLOCKED] msg {m.id} failed {ATTEMPTS}x - stopping this '
                               f'topic to preserve order; another topic will be claimed')
+                        diag('blocked', msg_id=m.id, topic=root, title=t.get('title'),
+                             cursor=cursor, file_name=fail_item.get('file_name'),
+                             size=fail_item.get('size', 0),
+                             prior_tries=retry_tries)
+                        _summary(f'- **BLOCKED** topic `{t.get("title")}` at old_msg '
+                                 f'`{m.id}` ({fail_item.get("file_name") or "?"}), '
+                                 f'{retry_tries} prior attempts')
                         api_post('/api/release', {'topic_root': root, 'worker_id': WORKER_ID})
                         blocked = True
                         break
@@ -805,6 +1022,74 @@ async def main():
 
     print(f'\n[DONE] worker {WORKER_ID} finished, {topics_done} topics fully processed')
     print(f'[CALLS] {_calls["n"]}/{CALL_BUDGET} panel calls used')
+    diag('run_end', topics_done=topics_done, calls=_calls['n'],
+         budget=CALL_BUDGET, secs=round(time.time() - START, 1))
+    _diag_report()
+
+
+def _diag_report():
+    """Roll the DIAG lines of THIS run into the Actions job summary.
+
+    The point: the pattern must be readable from the run page, without
+    downloading a log zip and grepping. Groups failures by (msg_id, error) and
+    shows whether the transfer ever moved a byte, which is the distinction
+    between "Telegram refused" and "the transfer broke".
+    """
+    if not DIAG_ON or not os.path.exists(DIAG_FILE):
+        return
+    try:
+        rows = [json.loads(l) for l in open(DIAG_FILE, encoding='utf-8') if l.strip()]
+    except Exception as e:
+        print(f'[DIAG] report failed: {type(e).__name__}')
+        return
+
+    fails = [r for r in rows if r['ev'] in ('dl_fail', 'msg_fail')]
+    if not fails:
+        _summary(f'### Migration diagnostics\n\nNo download failures this run '
+                 f'({len(rows)} diag events).')
+        return
+
+    by = {}
+    for r in fails:
+        k = (r.get('msg_id'), r.get('err'))
+        e = by.setdefault(k, {'n': 0, 'peak': 0.0, 'stages': set(),
+                              'file': r.get('file_name') or '', 'dc': r.get('dc'),
+                              'size': r.get('size') or 0, 'detail': r.get('detail', '')})
+        e['n'] += 1
+        e['peak'] = max(e['peak'], r.get('peak_mb') or 0)
+        if r.get('stage'):
+            e['stages'].add(r['stage'])
+
+    lines = ['### Migration diagnostics', '',
+             '| old_msg | file | MB | DC | err | tries | max bytes seen | verdict |',
+             '|---|---|---|---|---|---|---|---|']
+    for (mid, err), e in sorted(by.items(), key=lambda kv: -kv[1]['n']):
+        # peak == 0 across every strategy means Telegram never handed us a
+        # single byte -> the file is unreadable at source, not a slow transfer.
+        verdict = 'never sent a byte (source-side)' if e['peak'] == 0 \
+            else f'broke mid-transfer at {e["peak"]}MB'
+        lines.append(
+            f'| `{mid}` | {(e["file"] or "?")[:44]} | '
+            f'{round((e["size"] or 0) / 1048576, 1)} | {e["dc"]} | `{err}` | '
+            f'{e["n"]} | {e["peak"]}MB | {verdict} |')
+
+    refetch = [r for r in rows if r['ev'] == 'refetch_ok']
+    if refetch:
+        lines += ['', f'**{len(refetch)} file(s) succeeded only after re-fetching '
+                      f'the message** — those were STALE file_reference, not dead '
+                      f'files: ' + ', '.join(f'`{r["msg_id"]}`' for r in refetch)]
+
+    gone = [r for r in rows if r['ev'] == 'refetch_gone']
+    if gone:
+        lines += ['', f'**{len(gone)} message(s) no longer visible at source:** '
+                  + ', '.join(f'`{r["msg_id"]}`' for r in gone)]
+
+    lines += ['', '<details><summary>telethon tail for the first failure</summary>',
+              '', '```']
+    lines += [str(x) for x in (fails[0].get('tl') or ['(none captured)'])]
+    lines += ['```', '</details>']
+    _summary('\n'.join(lines))
+    print('[DIAG] job summary written')
 
 
 def StringSessionHolder():
@@ -819,5 +1104,14 @@ except QuotaExhausted as e:
     # failed would be misleading - nothing is broken and no data is at risk.
     print(f'[QUOTA] {e}')
     print('[QUOTA] exiting 0 - next wave will resume from the saved cursor')
+    diag('quota_abort', detail=str(e)[:200])
+    _summary(f'### Migration diagnostics\n\n**Aborted on account-wide rate '
+             f'limit** — no state invented, next wave resumes from the cursor.')
+except BaseException as e:
+    # Any other exit path must still leave the diagnostics behind, otherwise a
+    # crash is exactly the case where we learn nothing.
+    diag('crash', err=type(e).__name__, detail=str(e)[:300], tl=_tl_tail())
+    _diag_report()
+    raise
 
 
