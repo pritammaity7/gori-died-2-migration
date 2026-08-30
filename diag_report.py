@@ -73,6 +73,11 @@ def main(path):
 
     for ev, label in (('refetch_ok', 'STALE REFERENCE (fixed by re-fetch)'),
                       ('refetch_gone', 'message gone at source'),
+                      ('prove_ok', 'PROVED READABLE (transport problem, keep retrying)'),
+                      ('prove_fail', 'PROVED UNREADABLE (zero bytes on a fresh handle)'),
+                      ('prove_gone', 'PROVED GONE at source'),
+                      ('dead', 'DECLARED DEAD, placeholder posted, topic unblocked'),
+                      ('dead_failed', 'dead placeholder could not be posted'),
                       ('stall', 'stalled transfer'),
                       ('quota_abort', 'aborted on rate limit'),
                       ('crash', 'crashed')):
