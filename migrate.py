@@ -65,7 +65,20 @@ HDRS = {'x-migrate-key': KEY, 'content-type': 'application/json'}
 # requests and 5.1 BILLION D1 rows read in a single day (limits: 100k requests,
 # 5M rows). A worker must never be *able* to do that again, whatever the bug.
 CALL_BUDGET = int(os.environ.get('CALL_BUDGET', '2000'))
-_calls = {'n': 0}
+_calls = {'n': 0, 'rate_limited': 0}
+
+# QUOTA GUARD (2026-08-30). When the account's daily Worker quota is exhausted
+# every panel call returns Cloudflare's 429. Previously the worker kept going and
+# recorded messages it had never even attempted as "failed" - six phantom
+# failures were created that way in the last 20 minutes before a quota reset, and
+# each carried a fake 12-attempt history toward the DEAD threshold.
+# Now: after this many consecutive 429s the run stops cleanly. No progress is
+# invented, nothing is marked failed, and the next wave resumes from the cursor.
+RATE_LIMIT_ABORT = int(os.environ.get('RATE_LIMIT_ABORT', '3'))
+
+
+class QuotaExhausted(RuntimeError):
+    """Panel is rate limited account-wide; stop without inventing failures."""
 
 
 def budget_left():
@@ -103,16 +116,30 @@ def api_post(path, payload, tries=6):
         return {}
     _calls['n'] += 1
     hosts = [WORKER] + [h for h in (WORKER_ALT,) if h and h != WORKER]
+    saw_429 = False
     for attempt in range(tries):
         host = hosts[attempt % len(hosts)]
         try:
             r = requests.post(host + path, headers=HDRS, data=json.dumps(payload), timeout=30)
             if r.status_code == 200:
+                _calls['rate_limited'] = 0        # healthy again
                 return r.json()
             print(f'   [POST {path}] HTTP {r.status_code} (attempt {attempt + 1}/{tries})')
+            if r.status_code == 429:
+                saw_429 = True
+                time.sleep(20)
         except Exception as e:
             print(f'   [POST {path}] {type(e).__name__} (attempt {attempt + 1}/{tries})')
         time.sleep(min(60, 4 * (attempt + 1) ** 2))
+
+    if saw_429:
+        # Account-wide quota, not a per-request hiccup. Refusing to continue is
+        # essential: without state we cannot tell done from not-done, and guessing
+        # is what produced phantom failures before.
+        _calls['rate_limited'] += 1
+        if _calls['rate_limited'] >= RATE_LIMIT_ABORT:
+            raise QuotaExhausted(
+                f'panel rate limited on {_calls["rate_limited"]} consecutive calls')
     print(f'   [WARN] {path} unreachable, continuing (state may replay)')
     return {}
 
@@ -748,11 +775,21 @@ async def main():
             finally:
                 await batch.flush()
                 api_post('/api/release', {'topic_root': root, 'worker_id': WORKER_ID})
+        except QuotaExhausted as e:
+            # Do not release, do not mark anything: without the panel we cannot
+            # know what was done. Exit so the next wave resumes from the cursor.
+            print(f'\n[ABORT] {e} - stopping cleanly, no state invented')
+            break
         except Exception as e:
             print(f'   [TOPIC ERR] {type(e).__name__}: {e} (releasing, moving on)')
-            api_post('/api/release', {'topic_root': root, 'worker_id': WORKER_ID})
+            try:
+                api_post('/api/release', {'topic_root': root, 'worker_id': WORKER_ID})
+            except QuotaExhausted:
+                print('[ABORT] panel rate limited during release')
+                break
 
     print(f'\n[DONE] worker {WORKER_ID} finished, {topics_done} topics fully processed')
+    print(f'[CALLS] {_calls["n"]}/{CALL_BUDGET} panel calls used')
 
 
 def StringSessionHolder():
@@ -760,5 +797,12 @@ def StringSessionHolder():
     return StringSession(SESSION)
 
 
-asyncio.run(main())
+try:
+    asyncio.run(main())
+except QuotaExhausted as e:
+    # A clean, non-failing exit: the wave simply could not run. Marking the job
+    # failed would be misleading - nothing is broken and no data is at risk.
+    print(f'[QUOTA] {e}')
+    print('[QUOTA] exiting 0 - next wave will resume from the saved cursor')
+
 
