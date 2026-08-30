@@ -239,13 +239,28 @@ async def smart_download(client, msg, path):
 
     # 256 KB parts: legal per MTProto (1048576 % 262144 == 0) and far more
     # tolerant of a DC that is timing out on 1 MB reads.
+    #
+    # NOTE: part_size_kb belongs to download_file(), NOT download_media().
+    # Telethon 1.44's download_media signature is
+    # (message, file, thumb, progress_callback) - passing part_size_kb raised
+    # TypeError on EVERY fallback attempt, so once FAST-DL failed the message
+    # could never succeed and blocked its topic forever. That is exactly what
+    # 22279 / 11813 / 79731 / 20220 / 12161 were doing. Use iter_download, which
+    # does take request_size, and write the file ourselves.
     for attempt, (part, cooldown) in enumerate(((256 * 1024, 0), (128 * 1024, 45)), 1):
         if cooldown:
             print(f'   [DL COOLDOWN] waiting {cooldown}s for the DC to recover')
             await asyncio.sleep(cooldown)
 
         async def run_std():
-            return await client.download_media(msg, file=path, part_size_kb=part // 1024)
+            with open(path, 'wb') as f:
+                async for chunk in client.iter_download(msg, request_size=part):
+                    f.write(chunk)
+            if size:
+                got = os.path.getsize(path)
+                if got != size:
+                    raise RuntimeError(f'SIZE MISMATCH {got} != {size}')
+            return path
 
         try:
             return await _run_monitored(f'STD-DL/{part // 1024}k', run_std(), path)
