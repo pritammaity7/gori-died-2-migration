@@ -103,11 +103,16 @@ def doc_identity(msg):
     d = getattr(msg, 'document', None) or getattr(msg, 'photo', None)
     if d is None:
         return {'media': type(getattr(msg, 'media', None)).__name__}
+    # file_name lives on an attribute, not on the document itself
+    fn = ''
+    for a in (getattr(d, 'attributes', None) or []):
+        fn = getattr(a, 'file_name', '') or fn
     ref = getattr(d, 'file_reference', b'') or b''
     return {
         'doc_id': getattr(d, 'id', None),
         'dc': getattr(d, 'dc_id', None),
         'size': getattr(d, 'size', 0) or 0,
+        'file_name': fn,
         'ah_tail': str(getattr(d, 'access_hash', ''))[-6:],
         'ref_len': len(ref),
         'ref_head': ref[:4].hex(),
@@ -116,15 +121,20 @@ def doc_identity(msg):
 
 
 def _summary(md):
-    """Append to the GitHub Actions job summary (visible on the run page)."""
+    """Append to the GitHub Actions job summary (visible on the run page).
+
+    Returns True only if it was actually written, so callers do not claim to have
+    produced a summary when running outside Actions.
+    """
     p = os.environ.get('GITHUB_STEP_SUMMARY')
     if not p:
-        return
+        return False
     try:
         with open(p, 'a', encoding='utf-8') as f:
             f.write(md + '\n')
+        return True
     except OSError:
-        pass
+        return False
 
 
 API_ID = int(os.environ['TELEGRAM_API_ID'])
@@ -162,12 +172,21 @@ STALL_SECS = float(os.environ.get('STALL_SECS', '240'))             # no-progres
 # Attempts (across waves) before a topic is quarantined instead of retried.
 RETRY_CEILING = int(os.environ.get('RETRY_CEILING', '12'))
 # Attempts before a message is declared DEAD - i.e. Telegram itself will not
-# serve the bytes to anyone. Proven on 2026-08-29: one PDF failed from all five
-# user identities with fresh file_references, and sendMedia re-send is blocked by
-# the source group's forward restriction, so no legal path exists. A dead message
-# gets a placeholder in its exact position, which keeps the sequence intact and
-# means we never have to delete-and-replay a topic again.
-DEAD_AFTER = int(os.environ.get('DEAD_AFTER', '24'))
+# serve the bytes to anyone.
+#
+# Lowered from 24 to 6 on 2026-08-30. 24 was far too high: msg 12161 in topic
+# 2440 sat at 5-6 attempts for the whole day and blocked its topic the entire
+# time, because a blocked topic is resumed at the failure and can never pass it.
+# The cost of declaring dead too early is one placeholder message; the cost of
+# declaring too late is a whole course stalled indefinitely. It also gets a proof
+# step now (see prove_unreadable) so the count is not the only evidence.
+DEAD_AFTER = int(os.environ.get('DEAD_AFTER', '6'))
+# After this many attempts, spend ONE fresh-reference probe to decide the case
+# outright instead of waiting for the attempt counter to reach DEAD_AFTER.
+DEAD_PROVE_AFTER = int(os.environ.get('DEAD_PROVE_AFTER', '3'))
+# How long the probe is allowed to run. It only has to answer "did any byte ever
+# arrive", so it does not need to complete the download.
+PROVE_SECS = float(os.environ.get('PROVE_SECS', '90'))
 
 try:
     import fast_telethon as FT          # vendored parallel-transfer module
@@ -321,6 +340,13 @@ async def _run_monitored(label, coro, path):
     finally:
         # `peak` is what makes a failure readable: 0 means Telegram never sent a
         # byte, >0 means the transfer started and then broke.
+        # Sample once more here: the poll loop only looks every 20s, so a task
+        # that failed quickly would otherwise report a false 0 and be
+        # misclassified as "Telegram refused".
+        try:
+            peak = max(peak, os.path.getsize(path))
+        except OSError:
+            pass
         _run_monitored.last_peak = peak
 
 
@@ -330,20 +356,23 @@ _run_monitored.last_peak = 0
 async def smart_download(client, msg, path):
     """Download with three escalating strategies.
 
-    Root cause of the repeated failures (from the Action logs, 2026-08-29):
-        Telegram is having internal issues TimeoutError: Timeout while fetching
-        data (caused by GetFileRequest)   ->  ValueError: Request was unsuccessful
-        6 time(s)
-    Telethon retries a GetFileRequest `request_retries` times (default 5, hence
-    "6 time(s)") and then gives up. Per Telethon's docs those retries fire on
-    ServerError / RpcCallFail / migrate errors - i.e. a *transient* DC problem.
-    The file is fine; the DC route is briefly unhealthy.
+    What the logs actually show for a repeated failure:
+        ValueError: Request was unsuccessful 13 time(s)
+    That is Telethon's *give-up* message after exhausting `request_retries` on a
+    GetFileRequest. It names no cause. A sick DC route, an expired
+    `file_reference`, a genuinely unreadable file and a plain timeout all produce
+    that identical line, which is why earlier diagnoses of it were guesses. The
+    telethon logger (attached above, ring-buffered) carries the real RPC error and
+    is emitted with every `dl_fail` record.
 
-    So instead of failing the message we escalate:
+    The strategies escalate because the *transient DC* case is the common one and
+    is genuinely recoverable:
       1. FastTelethon parallel download (many senders, fastest)
       2. standard download with a smaller chunk size (gentler on a sick DC)
       3. standard download after a cooldown, giving the DC time to recover
-    Only if all three fail does the caller record a failure - and even then the
+      4. FRESH-DL - re-fetch the message for a new file_reference, which both
+         fixes and *proves* the stale-handle case
+    Only if all of those fail does the caller record a failure - and even then the
     message is never skipped, it just blocks its own topic until it succeeds.
     """
     doc = getattr(msg, 'document', None)
@@ -465,6 +494,60 @@ async def smart_download(client, msg, path):
                     except OSError:
                         pass
                     raise
+
+
+async def prove_unreadable(client, peer, msg_id):
+    """Decide, in one shot, whether Telegram will serve ANY byte of this message.
+
+    Called once a message has failed DEAD_PROVE_AFTER times. The attempt counter
+    alone is weak evidence - it counts our failures, not Telegram's refusal - and
+    waiting for it to climb to DEAD_AFTER leaves the whole topic blocked in the
+    meantime. This gets a definitive answer instead:
+
+      * re-fetch the message so the file_reference and access_hash are fresh,
+        removing the single most common false positive
+      * ask for only the FIRST chunk. If Telegram is willing to serve the file at
+        all, the first chunk arrives quickly; if it refuses, it refuses here too.
+
+    Returns (verdict, detail):
+      'readable'  - bytes arrived; this is a transport problem, keep retrying
+      'unreadable'- fresh handle, still zero bytes; safe to declare dead
+      'gone'      - the message or its media no longer exists at source
+      'unknown'   - we could not run the probe (flood wait, no media, etc.)
+    """
+    try:
+        fresh = (await client.get_messages(peer, ids=[msg_id]))[0]
+    except Exception as e:
+        diag('prove_error', msg_id=msg_id, err=type(e).__name__,
+             detail=str(e)[:200], tl=_tl_tail())
+        return 'unknown', f'{type(e).__name__}: {str(e)[:120]}'
+    if fresh is None or not fresh.media:
+        diag('prove_gone', msg_id=msg_id)
+        return 'gone', 'message or media no longer visible at source'
+
+    ident = doc_identity(fresh)
+    got = 0
+    t0 = time.time()
+    try:
+        async def first_chunk():
+            nonlocal got
+            async for chunk in client.iter_download(fresh, request_size=256 * 1024,
+                                                    limit=1):
+                got += len(chunk)
+                break
+        await asyncio.wait_for(first_chunk(), timeout=PROVE_SECS)
+    except Exception as e:
+        diag('prove_fail', msg_id=msg_id, err=type(e).__name__,
+             detail=str(e)[:200], got=got, secs=round(time.time() - t0, 1),
+             tl=_tl_tail(), **ident)
+        # Zero bytes from a FRESH handle is the strongest signal available that
+        # the file itself is unreadable rather than the route being unlucky.
+        return ('unreadable' if got == 0 else 'readable'), \
+            f'{type(e).__name__} after {got} bytes'
+
+    diag('prove_ok', msg_id=msg_id, got=got, secs=round(time.time() - t0, 1),
+         **ident, note='Telegram served the first chunk -> file is readable')
+    return ('readable' if got > 0 else 'unreadable'), f'{got} bytes in first chunk'
 
 
 class MsgBatch:
@@ -770,14 +853,37 @@ async def main():
         # must resume exactly there - never past it - because the destination
         # only appends.
         if retry_from is not None:
-            if retry_tries >= DEAD_AFTER:
-                # Every retry path has been exhausted many times over. Post a
-                # placeholder IN POSITION so the sequence keeps its slot, record
-                # the message as dead, and let the topic continue. No deletion,
-                # no replay - the position is occupied, so there is no hole.
+            # PROOF BEFORE PATIENCE.
+            #
+            # The old logic only counted attempts: retry until 24, then declare
+            # dead. That is why 12161 blocked topic 2440 all day - the counter
+            # crawled while the topic made zero progress, and the count itself
+            # never distinguished "Telegram refuses this file" from "our route was
+            # unlucky". Now, once a message has failed DEAD_PROVE_AFTER times, we
+            # spend one cheap probe to settle it.
+            verdict = detail = None
+            if retry_tries >= DEAD_PROVE_AFTER and retry_tries < DEAD_AFTER:
+                verdict, detail = await prove_unreadable(
+                    client, old, retry_from)
+                print(f'   [PROVE] old_msg {retry_from} after {retry_tries} '
+                      f'attempts: {verdict} ({detail})')
+                diag('prove', topic=root, title=t.get('title'),
+                     msg_id=retry_from, tries=retry_tries,
+                     verdict=verdict, detail=detail)
+            # 'gone' and 'unreadable' are both terminal: no further attempt can
+            # succeed, so treat them exactly like reaching DEAD_AFTER.
+            if retry_tries >= DEAD_AFTER or verdict in ('unreadable', 'gone'):
+                # No retry path can work. Post a placeholder IN POSITION so the
+                # sequence keeps its slot, record the message as dead, and let the
+                # topic continue. No deletion, no replay - the position is
+                # occupied, so there is no hole.
                 info = api_post('/api/deadinfo', {'topic_root': root,
                                                   'old_msg_id': retry_from}) or {}
                 name = info.get('file_name') or ''
+                why = ('no longer present at source' if verdict == 'gone' else
+                       'Telegram served zero bytes from a fresh reference'
+                       if verdict == 'unreadable' else
+                       f'{retry_tries} failed attempts')
                 try:
                     ph = await client.send_message(
                         new, f'⚠️ Missing file: {name or f"message {retry_from}"}\n'
@@ -789,12 +895,20 @@ async def main():
                         'topic_root': root, 'old_msg_id': retry_from,
                         'new_msg_id': ph.id, 'file_name': name,
                         'size': info.get('size') or 0, 'kind': info.get('kind') or 'unknown',
-                        'reason': 'unreadable at source after %d attempts' % retry_tries})
-                    print(f'   [DEAD] old_msg {retry_from} marked dead; placeholder '
-                          f'{ph.id} posted in position')
+                        'reason': f'{why} (after {retry_tries} attempts)'})
+                    print(f'   [DEAD] old_msg {retry_from} marked dead ({why}); '
+                          f'placeholder {ph.id} posted in position')
+                    diag('dead', topic=root, title=t.get('title'),
+                         msg_id=retry_from, tries=retry_tries, verdict=verdict,
+                         reason=why, placeholder=ph.id, file_name=name)
+                    _summary(f'- **DEAD** `{t.get("title")}` old_msg `{retry_from}` '
+                             f'({name or "?"}): {why}. Placeholder posted, topic '
+                             f'unblocked.')
                     continue
                 except Exception as e:
                     print(f'   [DEAD] placeholder failed: {type(e).__name__}: {str(e)[:80]}')
+                    diag('dead_failed', topic=root, msg_id=retry_from,
+                         err=type(e).__name__, detail=str(e)[:200])
                     api_post('/api/quarantine', {'topic_root': root})
                     continue
             if retry_tries >= RETRY_CEILING:
@@ -937,13 +1051,26 @@ async def main():
                             # cause. Here we attach the document identity, how
                             # far the transfer got, and the telethon records that
                             # preceded it.
-                            diag('msg_fail', msg_id=m.id, topic=root,
-                                 title=t.get('title'), attempt=attempt,
-                                 of=ATTEMPTS, err=type(e).__name__,
-                                 detail=str(e)[:300],
-                                 file_name=fail_item.get('file_name'),
-                                 size=fail_item.get('size', 0),
-                                 **doc_identity(m), tl=_tl_tail())
+                            #
+                            # Built as one dict, not as kwargs + **doc_identity:
+                            # doc_identity() also returns `size` and `file_name`,
+                            # and duplicate keyword arguments raise TypeError -
+                            # inside the except block, which would turn a handled
+                            # download failure into a crashed topic.
+                            rec = {'msg_id': m.id, 'topic': root,
+                                   'title': t.get('title'), 'attempt': attempt,
+                                   'of': ATTEMPTS, 'err': type(e).__name__,
+                                   'detail': str(e)[:300],
+                                   'peak_mb': round(
+                                       getattr(_run_monitored, 'last_peak', 0)
+                                       / 1048576, 2),
+                                   'tl': _tl_tail()}
+                            rec.update(doc_identity(m))
+                            # the ledger's own view wins for these two
+                            rec['file_name'] = (fail_item.get('file_name')
+                                                or rec.get('file_name') or '')
+                            rec['size'] = fail_item.get('size') or rec.get('size') or 0
+                            diag('msg_fail', **rec)
                         if attempt < ATTEMPTS:
                             back = 15 * attempt
                             print(f'   [RETRY] msg {m.id} again in {back}s')
@@ -1088,8 +1215,8 @@ def _diag_report():
               '', '```']
     lines += [str(x) for x in (fails[0].get('tl') or ['(none captured)'])]
     lines += ['```', '</details>']
-    _summary('\n'.join(lines))
-    print('[DIAG] job summary written')
+    if _summary('\n'.join(lines)):
+        print('[DIAG] job summary written')
 
 
 def StringSessionHolder():
