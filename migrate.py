@@ -188,6 +188,20 @@ DEAD_PROVE_AFTER = int(os.environ.get('DEAD_PROVE_AFTER', '3'))
 # How long the probe is allowed to run. It only has to answer "did any byte ever
 # arrive", so it does not need to complete the download.
 PROVE_SECS = float(os.environ.get('PROVE_SECS', '90'))
+# Telegram's real single-file ceiling for a non-Premium user account over MTProto
+# is 4000 parts x 512 KB = 2,097,152,000 bytes (2000 MiB). Verified 2026-09-02
+# against core.telegram.org/api/files and the saveBigFilePart part_count limit.
+#
+# The old cap here was 1950 MiB (2,044,723,200), i.e. 50 MiB of usable headroom
+# thrown away. #65342 `Vocab Phrasal_verb practice…mp4` is 2,047,906,619 bytes =
+# 1953.0 MiB: over the old cap by only 3.04 MiB, but 47 MiB UNDER what Telegram
+# actually accepts. It was refused for no reason.
+#
+# Set to the true limit, minus a 4 MiB safety margin for the attribute/caption
+# overhead that rides along with the media.
+UPLOAD_MAX = int(os.environ.get(
+    'UPLOAD_MAX_BYTES', str(4000 * 512 * 1024 - 4 * 1024 * 1024)))
+
 
 try:
     import fast_telethon as FT          # vendored parallel-transfer module
@@ -557,26 +571,53 @@ async def prove_unreadable(client, peer, msg_id):
     ident = doc_identity(fresh)
     got = 0
     t0 = time.time()
+    size = fresh.document.size if fresh.document else 0
+    # A one-chunk probe is not enough. #10465 (1038 MB) served its first 256 KB
+    # instantly and then crawled at 0.22 MB/s - 43 MB in 182 s, which is ~80
+    # minutes for the whole file and longer than the entire run budget. The old
+    # probe called that 'readable' and would retry it forever; the old counter
+    # called it dead and threw it away. Both were wrong.
+    #
+    # So measure THROUGHPUT, not liveness: read for PROVE_SECS and work out
+    # whether the file could finish inside one run at the rate observed.
     try:
-        async def first_chunk():
+        async def sample():
             nonlocal got
-            async for chunk in client.iter_download(fresh, request_size=256 * 1024,
-                                                    limit=1):
+            async for chunk in client.iter_download(fresh, request_size=1024 * 1024):
                 got += len(chunk)
-                break
-        await asyncio.wait_for(first_chunk(), timeout=PROVE_SECS)
+                if time.time() - t0 >= PROVE_SECS or got >= size:
+                    break
+        await asyncio.wait_for(sample(), timeout=PROVE_SECS * 1.5)
     except Exception as e:
         diag('prove_fail', msg_id=msg_id, err=type(e).__name__,
              detail=str(e)[:200], got=got, secs=round(time.time() - t0, 1),
              tl=_tl_tail(), **ident)
-        # Zero bytes from a FRESH handle is the strongest signal available that
-        # the file itself is unreadable rather than the route being unlucky.
-        return ('unreadable' if got == 0 else 'readable'), \
+        return ('unreadable' if got == 0 else 'slow'), \
             f'{type(e).__name__} after {got} bytes'
 
-    diag('prove_ok', msg_id=msg_id, got=got, secs=round(time.time() - t0, 1),
-         **ident, note='Telegram served the first chunk -> file is readable')
-    return ('readable' if got > 0 else 'unreadable'), f'{got} bytes in first chunk'
+    el = max(0.001, time.time() - t0)
+    rate = got / el
+    eta = (size / rate) if rate else float('inf')
+    ident.update(got=got, secs=round(el, 1),
+                 rate_mbs=round(rate / 1048576, 3), eta_min=round(eta / 60, 1))
+
+    if got == 0:
+        diag('prove_fail', msg_id=msg_id, note='fresh handle served nothing',
+             **ident)
+        return 'unreadable', 'zero bytes from a fresh reference'
+    if got >= size:
+        diag('prove_ok', msg_id=msg_id, note='whole file read during probe',
+             **ident)
+        return 'readable', f'complete, {got} bytes in {el:.0f}s'
+    # Could it finish inside the remaining run time, with slack for the upload?
+    if eta > max(600.0, remaining() * 0.5):
+        diag('prove_slow', msg_id=msg_id,
+             note='serves bytes but far too slowly to complete in one run',
+             **ident)
+        return 'slow', (f'{rate/1048576:.2f} MB/s -> ETA {eta/60:.0f} min for '
+                        f'{size/1048576:.0f} MB')
+    diag('prove_ok', msg_id=msg_id, note='healthy throughput', **ident)
+    return 'readable', f'{rate/1048576:.2f} MB/s, ETA {eta/60:.0f} min'
 
 
 class MsgBatch:
@@ -715,8 +756,32 @@ async def process_message(client, new, m, new_tid, row):
                    if hasattr(a, 'file_name')), '')
         meta.update(kind='video' if is_video(doc) else 'document',
                     file_name=fn, size=size)
-        if size > 1950 * 1024 * 1024:
-            return 'skipped', None, meta  # over Telegram 2GB upload cap
+        if size > UPLOAD_MAX:
+            # Genuinely beyond what Telegram will accept (see UPLOAD_MAX).
+            #
+            # Recorded as 'dead', not 'skipped'. Two reasons, both found
+            # 2026-09-02: 'skipped' also means "service message, nothing to
+            # copy", so overloading it hid real losses; and the site lists
+            # `status IN ('done','dead')`, so a dead row with a placeholder shows
+            # up in the course with its reason instead of leaving a silent hole.
+            # #65342 in ENGLISH SPL 1 vanished exactly this way.
+            why = (f'{size / 1048576:.0f} MB is over Telegram\'s '
+                   f'{UPLOAD_MAX / 1048576:.0f} MB single-file upload limit')
+            meta['caption'] = why
+            try:
+                ph = await client.send_message(
+                    new, f'⚠️ Could not copy: {fn or f"message {m.id}"}\n'
+                         f'{why}. It has to be split or uploaded by hand. '
+                         f'Everything before and after it is complete and in '
+                         f'order.',
+                    reply_to=new_tid)
+                meta['placeholder'] = ph.id
+                print(f'   [TOO BIG] {why}; placeholder {ph.id} in position')
+                return 'dead', ph.id, meta
+            except Exception as e:
+                print(f'   [TOO BIG] placeholder failed: '
+                      f'{type(e).__name__}: {str(e)[:80]}')
+                return 'dead', None, meta
         os.makedirs(DL_DIR, exist_ok=True)
         safe_fn = ''.join(c for c in (fn or f'file_{m.id}') if c not in '\\/:*?"<>|').strip() or f'file_{m.id}'
         final_path = os.path.join(DL_DIR, safe_fn)
@@ -882,7 +947,7 @@ async def main():
         # must resume exactly there - never past it - because the destination
         # only appends.
         if retry_from is not None:
-            # PROOF BEFORE PATIENCE.
+            # PROOF BEFORE PATIENCE, AND PROOF EVEN AT THE CEILING.
             #
             # The old logic only counted attempts: retry until 24, then declare
             # dead. That is why 12161 blocked topic 2440 all day - the counter
@@ -890,8 +955,28 @@ async def main():
             # never distinguished "Telegram refuses this file" from "our route was
             # unlucky". Now, once a message has failed DEAD_PROVE_AFTER times, we
             # spend one cheap probe to settle it.
+            #
+            # 2026-09-02 fix, in two parts.
+            #
+            # (a) The probe used to be skipped at exactly
+            # retry_tries >= DEAD_AFTER (`and retry_tries < DEAD_AFTER`), so the
+            # attempt counter alone still killed a file the moment it hit 6 -
+            # the exact defect the probe was added to remove. #10465
+            # (26. Plane Geometry Class 26, 1038 MB) died that way.
+            #
+            # (b) The probe itself was too weak: one 256 KB chunk. #10465 serves
+            # that chunk immediately and then crawls at 0.22 MB/s (43 MB in
+            # 182 s measured, ~80 min for the whole file), so "first chunk
+            # arrived" proved nothing. prove_unreadable() now measures
+            # throughput and returns a third verdict, 'slow'.
+            #
+            # 'slow' is neither dead nor retryable: retrying burns a whole run
+            # for nothing, and declaring it dead throws away a file that does
+            # exist. It gets a placeholder in position (so no hole) and the topic
+            # moves on, with the reason recorded so a human can forward it by
+            # hand. 'unknown' still falls through to the counter.
             verdict = detail = None
-            if retry_tries >= DEAD_PROVE_AFTER and retry_tries < DEAD_AFTER:
+            if retry_tries >= DEAD_PROVE_AFTER:
                 verdict, detail = await prove_unreadable(
                     client, old, retry_from)
                 print(f'   [PROVE] old_msg {retry_from} after {retry_tries} '
@@ -899,9 +984,11 @@ async def main():
                 diag('prove', topic=root, title=t.get('title'),
                      msg_id=retry_from, tries=retry_tries,
                      verdict=verdict, detail=detail)
-            # 'gone' and 'unreadable' are both terminal: no further attempt can
-            # succeed, so treat them exactly like reaching DEAD_AFTER.
-            if retry_tries >= DEAD_AFTER or verdict in ('unreadable', 'gone'):
+            # 'gone', 'unreadable' and 'slow' are all terminal for the fleet:
+            # no further automated attempt can succeed. Otherwise the counter may
+            # only give up on a file the probe has not vouched for.
+            if verdict in ('unreadable', 'gone', 'slow') or (
+                    retry_tries >= DEAD_AFTER and verdict != 'readable'):
                 # No retry path can work. Post a placeholder IN POSITION so the
                 # sequence keeps its slot, record the message as dead, and let the
                 # topic continue. No deletion, no replay - the position is
@@ -912,13 +999,25 @@ async def main():
                 why = ('no longer present at source' if verdict == 'gone' else
                        'Telegram served zero bytes from a fresh reference'
                        if verdict == 'unreadable' else
+                       f'too slow to transfer: {detail}' if verdict == 'slow' else
                        f'{retry_tries} failed attempts')
+                # The notice must not claim "no longer serves this file" for a
+                # 'slow' verdict - the file is there, it just will not move fast
+                # enough for an automated run. Saying otherwise is what made the
+                # #10465 placeholder misleading.
+                body = (f'⚠️ Missing file: {name or f"message {retry_from}"}\n'
+                        f'Telegram serves this file too slowly to copy '
+                        f'automatically ({detail}), so it needs to be forwarded '
+                        f'by hand. Everything before and after it is complete '
+                        f'and in order.'
+                        if verdict == 'slow' else
+                        f'⚠️ Missing file: {name or f"message {retry_from}"}\n'
+                        f'Telegram no longer serves this file from the source '
+                        f'channel, so it could not be copied. Everything before '
+                        f'and after it is complete and in order.')
                 try:
                     ph = await client.send_message(
-                        new, f'⚠️ Missing file: {name or f"message {retry_from}"}\n'
-                             f'Telegram no longer serves this file from the source '
-                             f'channel, so it could not be copied. Everything before '
-                             f'and after it is complete and in order.',
+                        new, body,
                         reply_to=await ensure_new_topic(client, new, t))
                     api_post('/api/dead', {
                         'topic_root': root, 'old_msg_id': retry_from,
