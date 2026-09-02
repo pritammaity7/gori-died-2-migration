@@ -9,6 +9,7 @@ Env: TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION (StringSession),
 """
 import asyncio, os, sys, time, json
 import logging
+import re
 from collections import deque
 import requests
 from telethon import TelegramClient, errors
@@ -210,9 +211,27 @@ _calls = {'n': 0, 'rate_limited': 0}
 # invented, nothing is marked failed, and the next wave resumes from the cursor.
 RATE_LIMIT_ABORT = int(os.environ.get('RATE_LIMIT_ABORT', '3'))
 
+# The panel answers a Workers-request overrun with HTTP 429, but a D1 ROW-limit
+# overrun with HTTP 500 and this text in the body. Both mean "the account is out
+# of quota, nothing you retry will work"; only the first was recognised, so on
+# 2026-09-01 every wave from 14:00 UTC onward spent its whole hour retrying
+# /api/claim six times per call and achieved nothing. Match on the body too.
+QUOTA_BODY = re.compile(
+    r'row read limit|rows read limit|exceeded .{0,40}free tier|D1_ERROR.*limit',
+    re.I)
+
+
+def _is_quota_body(text):
+    return bool(text) and bool(QUOTA_BODY.search(text[:400]))
+
 
 class QuotaExhausted(RuntimeError):
-    """Panel is rate limited account-wide; stop without inventing failures."""
+    """Panel cannot serve us: account-wide quota (requests or D1 rows) is gone.
+
+    Raised so the run stops cleanly instead of inventing state. Without the panel
+    we cannot tell done from not-done, and guessing is what produced phantom
+    failures on 2026-08-30.
+    """
 
 
 def budget_left():
@@ -234,7 +253,7 @@ def api_get(path, tries=6):
             if r.status_code == 200:
                 return r.json()
             print(f'   [GET {path}] HTTP {r.status_code} (attempt {attempt + 1}/{tries})')
-            if r.status_code == 429:
+            if r.status_code == 429 or _is_quota_body(r.text):
                 # account-level quota: backing off harder is the only sane move
                 time.sleep(30)
         except Exception as e:
@@ -251,6 +270,7 @@ def api_post(path, payload, tries=6):
     _calls['n'] += 1
     hosts = [WORKER] + [h for h in (WORKER_ALT,) if h and h != WORKER]
     saw_429 = False
+    quota_reason = ''
     for attempt in range(tries):
         host = hosts[attempt % len(hosts)]
         try:
@@ -261,7 +281,15 @@ def api_post(path, payload, tries=6):
             print(f'   [POST {path}] HTTP {r.status_code} (attempt {attempt + 1}/{tries})')
             if r.status_code == 429:
                 saw_429 = True
+                quota_reason = quota_reason or 'HTTP 429 (Workers request limit)'
                 time.sleep(20)
+            elif _is_quota_body(r.text):
+                # HTTP 500 carrying D1's row-limit message. Same meaning as a 429:
+                # the account is out of quota until 00:00 UTC. Retrying is futile.
+                saw_429 = True
+                quota_reason = quota_reason or f'HTTP {r.status_code} D1 row limit'
+                print(f'   [QUOTA] D1 row limit reached: {r.text[:120]}')
+                break
         except Exception as e:
             print(f'   [POST {path}] {type(e).__name__} (attempt {attempt + 1}/{tries})')
         time.sleep(min(60, 4 * (attempt + 1) ** 2))
@@ -273,7 +301,8 @@ def api_post(path, payload, tries=6):
         _calls['rate_limited'] += 1
         if _calls['rate_limited'] >= RATE_LIMIT_ABORT:
             raise QuotaExhausted(
-                f'panel rate limited on {_calls["rate_limited"]} consecutive calls')
+                f'panel out of quota on {_calls["rate_limited"]} consecutive calls '
+                f'({quota_reason})')
     print(f'   [WARN] {path} unreachable, continuing (state may replay)')
     return {}
 
