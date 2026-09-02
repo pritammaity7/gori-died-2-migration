@@ -915,6 +915,32 @@ async def main():
     new = await client.get_entity(NEW_ID)
     print(f'[OK] {me.first_name} | worker={WORKER_ID} | budget {BUDGET_MIN} min')
 
+    # Is AES being done in Rust or in the interpreter? This decides throughput
+    # more than anything else in this file, and it fails SILENTLY: Telethon just
+    # logs at INFO and carries on with `pyaes`. When cryptg is missing, every
+    # transferred byte is encrypted or decrypted in Python, which is what held
+    # measured speed at 0.22-0.38 MB/s.
+    #
+    # Printed on every run so a broken install shows up in the log instead of
+    # quietly costing 5x. Not fatal: a slow migration still beats no migration.
+    try:
+        from telethon.crypto import aes as _tl_aes
+        if getattr(_tl_aes, 'cryptg', None) is not None:
+            print('[CRYPTO] cryptg active - AES-IGE in Rust')
+            diag('crypto', backend='cryptg')
+        else:
+            from telethon.crypto import libssl as _tl_libssl
+            if _tl_libssl.encrypt_ige and _tl_libssl.decrypt_ige:
+                print('[CRYPTO] libssl fallback - acceptable')
+                diag('crypto', backend='libssl')
+            else:
+                print('[CRYPTO][WARN] pure-Python AES (pyaes). Transfers will be '
+                      'CPU-bound and several times slower. Is cryptg in '
+                      'requirements.txt and did pip install succeed?')
+                diag('crypto', backend='pyaes', warn=True)
+    except Exception as e:
+        print(f'[CRYPTO] backend check failed: {type(e).__name__}')
+
     # ALWAYS re-seed: refreshes top_msg for known topics (catches new messages
     # appended to old topics) and discovers newly-closed topics (patrol mode).
     # NOTE: /api/state used to be called twice here and its result thrown away -
