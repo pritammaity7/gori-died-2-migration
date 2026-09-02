@@ -1,2 +1,13 @@
 telethon==1.44.0
 requests==2.32.3
+# AES-IGE in Rust instead of pure Python. Telethon picks it up automatically the
+# moment it is importable - no code change, no behaviour change, same wire
+# protocol. Every byte in both directions is currently being encrypted or
+# decrypted by `pyaes` in the interpreter, which is why measured throughput sat
+# at 0.22-0.38 MB/s on files that should move far faster: the ceiling was CPU,
+# not the network.
+#
+# Verified 2026-09-03: cryptg 0.6.0 ships a cp311 manylinux_2_28_x86_64 wheel,
+# which is exactly what ubuntu-latest + python-version '3.11' resolves to, so the
+# runner installs a prebuilt binary and never compiles anything.
+cryptg==0.6.0
