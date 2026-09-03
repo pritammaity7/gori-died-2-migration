@@ -325,6 +325,38 @@ def remaining():
     return BUDGET_MIN * 60 - (time.time() - START)
 
 
+# Seconds reserved after the last transfer for the shutdown path: the final
+# batch.flush(), /api/release, the summary, and Telethon disconnecting. Without
+# this the run can be killed mid-flush and lose ledger rows it already earned.
+CLEANUP_MARGIN = float(os.environ.get('CLEANUP_MARGIN', '90'))
+
+
+def msg_timeout():
+    """PER_MSG_TIMEOUT, clamped to what is actually left of the run budget.
+
+    PER_MSG_TIMEOUT used to be passed to asyncio.wait_for as a flat constant,
+    and the budget was only consulted BEFORE an attempt started. So a message
+    beginning at minute 45 of a 48-minute budget was allowed to run to minute
+    75 - past GitHub's `timeout-minutes: 59`, which SIGKILLs the job.
+
+    Seven runs on 2026-09-03 died exactly that way (cancelled at 59.1-60.3 min).
+    Each one lost its `finally:` block, so `/api/release` never fired and the
+    topic stayed claimed until the 40-minute lease lapsed. One measured case:
+    a 614 MB upload hit the 1800 s watchdog, retried, then took another 1430 s -
+    54 minutes on a single message.
+
+    Clamping can only ever REDUCE the time a transfer is given, never extend it,
+    so it cannot widen the lease-expiry window that the duplicate-upload race
+    depends on. What it buys is that the run now ends by its own budget, inside
+    its own `finally`, instead of being killed from outside.
+
+    The 60 s floor exists so the value is never absurdly small; the caller
+    already refuses to start an attempt below 180 s remaining, so in practice
+    the floor is unreachable.
+    """
+    return max(60.0, min(PER_MSG_TIMEOUT, remaining() - CLEANUP_MARGIN))
+
+
 def topic_is_forum_topic(m):
     """True if this message lives inside a named forum topic (not the General area)."""
     rt = getattr(m, 'reply_to', None)
@@ -1157,21 +1189,66 @@ async def main():
                     ATTEMPTS = 3
                     status = new_mid = meta = None
                     fail_item = None
+                    this_timeout = PER_MSG_TIMEOUT
                     for attempt in range(1, ATTEMPTS + 1):
                         if remaining() < 180:
                             print('[TIME] not enough budget for another attempt')
                             await batch.flush()
                             return
                         try:
+                            # Clamped to the remaining budget: a flat 1800s here
+                            # let one file overrun the run and get the job killed
+                            # by GitHub, losing the finally/release. See
+                            # msg_timeout().
+                            this_timeout = msg_timeout()
                             status, new_mid, meta = await asyncio.wait_for(
                                 process_message(client, new, m, new_tid, t),
-                                timeout=PER_MSG_TIMEOUT)
+                                timeout=this_timeout)
                             fail_item = None
                             break
                         except asyncio.TimeoutError:
                             sz = getattr(getattr(m, 'document', None), 'size', 0) or 0
+                            budget_capped = this_timeout < PER_MSG_TIMEOUT
+                            # A BUDGET-CAPPED cut is not the file's fault - the run
+                            # simply ran out of time. Recording 'failed' here would
+                            # be actively harmful: a failed row with no done/dead
+                            # sibling becomes `retry_from`, which HEAD-OF-LINE
+                            # BLOCKS the whole topic. A 499MB upload measured at
+                            # 0.31 MB/s legitimately needs ~27 min, so clamping
+                            # would otherwise convert slow-but-working files into
+                            # permanent topic blockers.
+                            #
+                            # So: stop cleanly, leave the cursor where it is, and
+                            # let the next wave retry this exact message with a
+                            # full budget. The `finally` below flushes and releases
+                            # the claim - which is what the killed runs never got
+                            # to do.
+                            if budget_capped:
+                                print(f'   [TIME] run budget cut msg {m.id} after '
+                                      f'{this_timeout:.0f}s ({sz / 1048576:.0f}MB); '
+                                      f'NOT marking failed - next wave resumes here')
+                                diag('budget_cut', msg_id=m.id, topic=root,
+                                     attempt=attempt, granted=round(this_timeout, 1),
+                                     per_msg_timeout=PER_MSG_TIMEOUT,
+                                     remaining=round(remaining(), 1), size=sz,
+                                     peak_mb=round(getattr(_run_monitored,
+                                                           'last_peak', 0)
+                                                   / 1048576, 2))
+                                await batch.flush()
+                                return
+                            # A genuine PER_MSG_TIMEOUT: the file really did get its
+                            # full 30 minutes and still did not finish. That IS a
+                            # failure and must be recorded as before.
                             print(f'   [WATCHDOG] msg {m.id} attempt {attempt}/{ATTEMPTS} '
-                                  f'exceeded {PER_MSG_TIMEOUT}s ({sz / 1048576:.0f}MB)')
+                                  f'exceeded {this_timeout:.0f}s ({sz / 1048576:.0f}MB)')
+                            diag('watchdog', msg_id=m.id, topic=root,
+                                 attempt=attempt, of=ATTEMPTS,
+                                 timeout=round(this_timeout, 1),
+                                 per_msg_timeout=PER_MSG_TIMEOUT,
+                                 remaining=round(remaining(), 1),
+                                 size=sz,
+                                 peak_mb=round(getattr(_run_monitored, 'last_peak', 0)
+                                               / 1048576, 2))
                             fail_item = {'old_msg_id': m.id, 'cursor': cursor,
                                          'status': 'failed', 'kind': 'unknown',
                                          'file_name': 'watchdog-timeout',
