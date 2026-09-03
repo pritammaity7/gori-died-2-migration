@@ -40,6 +40,14 @@ jobs:
           MIGRATE_KEY: ${{ secrets.MIGRATE_KEY }}
           TIME_BUDGET_MIN: '48'
           SHARD: ${{ github.event.client_payload.shard || 'manual' }}
+          # Unbuffered stdout. `print()` in migrate.py does not pass flush=True,
+          # and stdout to a non-TTY is 8 KB block-buffered, so when GitHub
+          # SIGKILLs the job at `timeout-minutes` the whole buffer dies with the
+          # process. That is why every cancelled run looked like it had crashed
+          # immediately: the log showed nothing past the first flushed [DIAG]
+          # line even though the worker had been transferring for 59 minutes.
+          # An unflushed log is worse than no log - it points at the wrong place.
+          PYTHONUNBUFFERED: '1'
           # DIAGNOSTICS. Every failure now emits one `[DIAG] {json}` line with the
           # document identity, how many bytes ever arrived, and the telethon
           # records that preceded the give-up. Without the telethon logger the
