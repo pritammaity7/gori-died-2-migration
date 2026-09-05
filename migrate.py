@@ -949,15 +949,23 @@ async def main():
     # `uploads` - and an unrecorded copy is copied again next wave. That is how
     # the 122 duplicates were made in August.
     #
+    # /api/preflight reports the READ and WRITE paths separately, because D1's
+    # caps are separate counters and only the write one makes copying unsafe.
+    #
     # Deliberately ABOVE client.connect(): connecting five shards to one
     # Telegram account for no reason is what risks AuthKeyDuplicatedError.
-    # /api/state is a read; when the account is out of quota the panel answers
-    # with the row-limit body, which _is_quota_body() recognises.
-    probe = api_get('/api/state')
-    if not probe or 'topics' not in probe:
-        print('[PREFLIGHT] panel/D1 not answering - exiting 0 without touching '
-              'Telegram. Nothing lost; the next cron tick retries.')
-        print('[PREFLIGHT] if this is the daily D1 cap it clears at 00:00 UTC.')
+    pre = api_post('/api/preflight', {}) or {}
+    if not pre.get('read') or not pre.get('write'):
+        which = ('reads' if not pre.get('read')
+                 else 'writes' if not pre.get('write') else 'unknown')
+        print(f'[PREFLIGHT] D1 is refusing {which} - exiting 0 without touching '
+              f'Telegram. {str(pre.get("reason") or "")[:120]}')
+        print('[PREFLIGHT] copying without a ledger row is how duplicates are '
+              'made, so this is a correctness stop, not just a quota one.')
+        print('[PREFLIGHT] the daily cap clears at 00:00 UTC and the next cron '
+              'tick resumes automatically. Nothing was lost.')
+        diag('preflight_stop', read=bool(pre.get('read')),
+             write=bool(pre.get('write')))
         return
 
     client = TelegramClient(StringSessionHolder(), API_ID, API_HASH,
