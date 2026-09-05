@@ -731,7 +731,19 @@ def is_video(doc):
 
 
 async def seed_topics(client, old):
-    """Fetch all topics from old group, keep CLOSED ones only, push to D1."""
+    """Push EVERY topic to D1 with its real `closed` flag.
+
+    2026-09-05: this used to filter to `if t.closed` and hardcode
+    `'closed': True` on the rows it sent. That is why "closed topics only" was
+    never actually enforced: a topic that was closed at first seed and later
+    RE-OPENED simply stopped appearing in the payload, so its existing row kept
+    `closed = 1` forever and claim() (which has no closed test) carried on
+    handing it out. `Blah blah timepass` (37761) is open in Telegram and had
+    33,133 messages of chat filler copied that way.
+
+    Sending the full list with the true flag lets /api/seed's ON CONFLICT
+    correct a re-opened topic on the very next wave.
+    """
     topics, offset_topic, offset_date, offset_id = [], 0, None, 0
     while True:
         res = await client(GetForumTopicsRequest(
@@ -745,11 +757,17 @@ async def seed_topics(client, old):
         offset_id = res.topics[-1].top_message
         if len(res.topics) < 100:
             break
-    closed = [{'root_id': t.id, 'title': getattr(t, 'title', f'topic-{t.id}'),
-               'closed': True, 'top_msg': t.top_message or 0}
-              for t in topics if t.closed]
-    print(f'[SEED] {len(topics)} topics total, {len(closed)} closed -> migrating these')
-    api_post('/api/seed', {'topics': closed})
+    allrows = [{'root_id': t.id, 'title': getattr(t, 'title', f'topic-{t.id}'),
+                'closed': bool(t.closed), 'top_msg': t.top_message or 0}
+               for t in topics]
+    closed = [r for r in allrows if r['closed']]
+    reopened = [r for r in allrows if not r['closed']]
+    print(f'[SEED] {len(topics)} topics total, {len(closed)} closed, '
+          f'{len(reopened)} OPEN -> only closed ones are migrated')
+    for r in reopened:
+        print(f"[SEED]   OPEN (will not be claimed): {r['root_id']} "
+              f"{r['title'][:44]!r}")
+    api_post('/api/seed', {'topics': allrows})
     return closed
 
 
@@ -923,6 +941,25 @@ async def main():
         print(f'[STAGGER] shard {SHARD}: waiting {slot}s before startup')
         await asyncio.sleep(slot)
 
+    # PREFLIGHT (2026-09-05): if D1 is refusing, stop BEFORE touching Telegram.
+    #
+    # Without this the wave still connected, re-seeded, then spent three idle
+    # claim rounds (60 s apart) getting {} back before giving up. Worse, it is the
+    # window where a message can be forwarded to Telegram but not recorded in
+    # `uploads` - and an unrecorded copy is copied again next wave. That is how
+    # the 122 duplicates were made in August.
+    #
+    # Deliberately ABOVE client.connect(): connecting five shards to one
+    # Telegram account for no reason is what risks AuthKeyDuplicatedError.
+    # /api/state is a read; when the account is out of quota the panel answers
+    # with the row-limit body, which _is_quota_body() recognises.
+    probe = api_get('/api/state')
+    if not probe or 'topics' not in probe:
+        print('[PREFLIGHT] panel/D1 not answering - exiting 0 without touching '
+              'Telegram. Nothing lost; the next cron tick retries.')
+        print('[PREFLIGHT] if this is the daily D1 cap it clears at 00:00 UTC.')
+        return
+
     client = TelegramClient(StringSessionHolder(), API_ID, API_HASH,
                             # Transient DC timeouts were the top cause of failed
                             # messages: Telethon gave up after 6 tries and raised
@@ -974,9 +1011,12 @@ async def main():
         print(f'[CRYPTO] backend check failed: {type(e).__name__}')
 
     # ALWAYS re-seed: refreshes top_msg for known topics (catches new messages
-    # appended to old topics) and discovers newly-closed topics (patrol mode).
+    # appended to old topics), discovers newly-closed topics (patrol mode), AND
+    # since 2026-09-05 corrects a topic that has been RE-OPENED - it now sends
+    # every topic with its real `closed` flag instead of only the closed ones.
     # NOTE: /api/state used to be called twice here and its result thrown away -
-    # ten of the heaviest requests per wave for nothing. Removed.
+    # ten of the heaviest requests per wave for nothing. The one call that
+    # remains is the preflight above, and its result IS used.
     await seed_topics(client, old)
 
     topics_done = 0
@@ -1136,28 +1176,22 @@ async def main():
             blocked = False
             last_hb = time.time()
             last_seen = cursor
-            # CONTIGUITY GUARD (2026-08-29): before appending anything, prove the
-            # ledger has no gap below the cursor. Telegram only appends, so
-            # copying while an earlier message is missing permanently breaks the
-            # lesson order. If a gap exists we refuse the topic and report it
-            # rather than making the damage worse.
+            # CONTIGUITY GUARD - REMOVED 2026-09-05.
             #
-            # The guard now asks the panel for a single aggregate instead of
-            # pulling every done_id: returning the whole ledger per claim is what
-            # produced 5.1 billion D1 rows read in a day.
-            gap_found = None
-            try:
-                g = api_post('/api/gapcheck', {'topic_root': root, 'cursor': cursor}) or {}
-                gap_found = g.get('gap_at')
-            except Exception as e:
-                print(f'   [GUARD] contiguity probe skipped: {type(e).__name__}')
-            if gap_found is not None:
-                print(f'   [GUARD] ledger gap at old_msg {gap_found} (cursor={cursor}) - '
-                      f'refusing to append; reporting for repair')
-                api_post('/api/update', {'topic_root': root, 'cursor': cursor,
-                                         'gap_at': gap_found})
-                api_post('/api/release', {'topic_root': root, 'worker_id': WORKER_ID})
-                continue
+            # This used to POST /api/gapcheck before every topic. The endpoint's
+            # response has `gap_at` hardcoded to null, so `gap_found` was ALWAYS
+            # None and the refuse-to-append branch could never fire. The call did
+            # nothing except run
+            #     SELECT COUNT(DISTINCT old_msg_id) ... WHERE topic_root = ?
+            #                                            AND old_msg_id <= ?
+            # which is an indexed range read of every ledger row below the cursor:
+            # measured at 6,842 rows_read per call, 465,265 rows/day = 83% of the
+            # whole account's D1 reads, for a result that was discarded.
+            #
+            # Contiguity is already guaranteed by the design that replaced it:
+            # `cursor` only advances after a message is durably recorded, and
+            # iter_messages(min_id=cursor, reverse=True) cannot skip an id. The
+            # head-of-line retry (`retry_from`) covers the failure case.
 
             try:
                 it = client.iter_messages(old, reply_to=None if is_general else root,
